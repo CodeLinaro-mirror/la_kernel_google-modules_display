@@ -1565,7 +1565,7 @@ static int decon_bind(struct device *dev, struct device *master, void *data)
 	struct drm_device *drm_dev = data;
 	struct exynos_drm_private *priv = drm_to_exynos_dev(drm_dev);
 	struct drm_plane *default_plane;
-	int i;
+	int i, ret;
 	char symlink_name_buffer[7];
 
 	decon->drm_dev = drm_dev;
@@ -1613,8 +1613,11 @@ static int decon_bind(struct device *dev, struct device *master, void *data)
 
 	/* Create symlink to decon device */
 	snprintf(symlink_name_buffer, 7, "decon%d", decon->id);
-	sysfs_create_link(&decon->drm_dev->dev->kobj, &decon->dev->kobj,
+	ret = sysfs_create_link(&decon->drm_dev->dev->kobj, &decon->dev->kobj,
 			  (const char *) symlink_name_buffer);
+	if (ret)
+		decon_warn(decon, "unable to link decon%d sysfs (%d)\n",
+			   decon->id, ret);
 
 	device_create_file(dev, &dev_attr_early_wakeup);
 	decon_debug(decon, "%s -\n", __func__);
