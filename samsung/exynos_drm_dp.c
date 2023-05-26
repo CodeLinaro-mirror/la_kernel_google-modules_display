@@ -357,9 +357,8 @@ static void dp_validate_link_training(struct dp_device *dp, bool *cr_done,
 		if (same_pre && same_volt)
 			*same_before_adjust = true;
 
-		if (!*cr_done && req_vol[i] + req_pre[i] >= 3) {
+		if (!*cr_done && req_max[i] != 0) {
 			*max_swing_reached = true;
-			return;
 		}
 	}
 }
@@ -503,8 +502,8 @@ static bool dp_do_link_training_cr(struct dp_device *dp, u32 interval_us)
 					  link_status);
 
 		if (max_swing_reached) {
-			dp_info(dp, "requested to adjust max swing level\n");
 			if (!try_max_swing) {
+				dp_info(dp, "adjust to max swing level\n");
 				try_max_swing = true;
 				continue;
 			} else {
@@ -514,7 +513,6 @@ static bool dp_do_link_training_cr(struct dp_device *dp, u32 interval_us)
 		}
 
 		if (cr_done) {
-			dp_print_swing_level(dp);
 			dp_info(dp, "CR Done. Move to Training_EQ.\n");
 			return true;
 		}
@@ -605,8 +603,8 @@ static bool dp_do_link_training_eq(struct dp_device *dp, u32 interval_us,
 					  link_status);
 
 		if (max_swing_reached) {
-			dp_info(dp, "requested to adjust max swing level\n");
 			if (!try_max_swing) {
+				dp_info(dp, "adjust to max swing level\n");
 				try_max_swing = true;
 				continue;
 			} else {
@@ -618,7 +616,6 @@ static bool dp_do_link_training_eq(struct dp_device *dp, u32 interval_us,
 		if (cr_done) {
 			if (drm_dp_channel_eq_ok(link_status,
 						 dp->link.num_lanes)) {
-				dp_print_swing_level(dp);
 				dp_info(dp,
 					"EQ Done. Move to Training_Done.\n");
 				return true;
@@ -665,14 +662,6 @@ static int dp_do_full_link_training(struct dp_device *dp, u32 interval_us)
 					"reducing link rate to %u during CR phase\n",
 					dp->link.link_rate);
 				continue;
-			} else if (dp->link.num_lanes > 1) {
-				dp->link.num_lanes >>= 1;
-				dp->link.link_rate = dp_get_max_link_rate(dp);
-
-				dp_info(dp,
-					"reducing lanes number to %u during CR phase\n",
-					dp->link.num_lanes);
-				continue;
 			}
 
 			dp_err(dp, "Link training failed during CR phase\n");
@@ -681,18 +670,9 @@ static int dp_do_full_link_training(struct dp_device *dp, u32 interval_us)
 
 		// Link Training: Channel Equalization
 		if (!dp_do_link_training_eq(dp, interval_us, supported_tps)) {
-			if (dp->link.num_lanes > 1) {
-				dp->link.num_lanes >>= 1;
-
-				dp_info(dp,
-					"reducing lanes number to %u during EQ phase\n",
-					dp->link.num_lanes);
-				continue;
-			} else if (drm_dp_link_rate_to_bw_code(
-					   dp->link.link_rate) !=
-				   DP_LINK_BW_1_62) {
+			if (drm_dp_link_rate_to_bw_code(dp->link.link_rate) !=
+			    DP_LINK_BW_1_62) {
 				dp_get_lower_link_rate(&dp->link);
-				dp->link.num_lanes = dp_get_max_num_lanes(dp);
 
 				dp_info(dp,
 					"reducing link rate to %u during EQ phase\n",
