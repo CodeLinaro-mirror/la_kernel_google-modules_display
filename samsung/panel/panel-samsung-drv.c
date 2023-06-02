@@ -69,6 +69,7 @@ inline void exynos_panel_msleep(u32 delay_ms)
 	dsim_trace_msleep(delay_ms);
 }
 EXPORT_SYMBOL(exynos_panel_msleep);
+static void exynos_panel_node_attach(struct exynos_drm_connector *exynos_connector);
 
 static inline bool is_backlight_off_state(const struct backlight_device *bl)
 {
@@ -462,6 +463,12 @@ int exynos_panel_init(struct exynos_panel *ctx)
 
 	if (funcs && funcs->panel_init)
 		funcs->panel_init(ctx);
+
+	if (funcs && funcs->run_normal_mode_work) {
+		dev_info(ctx->dev, "%s: schedule normal_mode_work\n", __func__);
+		schedule_delayed_work(&ctx->normal_mode_work,
+				      msecs_to_jiffies(ctx->normal_mode_work_delay_ms));
+	}
 
 	return ret;
 }
@@ -1949,10 +1956,17 @@ static int exynos_panel_connector_set_property(
 	return 0;
 }
 
+static int exynos_panel_connector_late_register(struct exynos_drm_connector *exynos_connector)
+{
+	exynos_panel_node_attach(exynos_connector);
+	return 0;
+}
+
 static const struct exynos_drm_connector_funcs exynos_panel_connector_funcs = {
 	.atomic_print_state = exynos_panel_connector_print_state,
 	.atomic_get_property = exynos_panel_connector_get_property,
 	.atomic_set_property = exynos_panel_connector_set_property,
+	.late_register = exynos_panel_connector_late_register,
 };
 
 static void exynos_panel_set_dimming(struct exynos_panel *ctx, bool dimming_on)
@@ -2374,6 +2388,8 @@ static int panel_debugfs_add(struct exynos_panel *ctx, struct dentry *parent)
 	debugfs_create_u32("rev", 0600, parent, &ctx->panel_rev);
 	debugfs_create_bool("lhbm_postwork_disabled", 0600, parent,
 			    &ctx->hbm.local_hbm.post_work_disabled);
+	debugfs_create_u32("normal_mode_work_delay_ms", 0600, parent,
+			   &ctx->normal_mode_work_delay_ms);
 
 	if (!funcs)
 		return -EINVAL;
@@ -3378,13 +3394,36 @@ static const char *exynos_panel_get_sysfs_name(struct exynos_panel *ctx)
 	return "primary-panel";
 }
 
+static void exynos_panel_node_attach(struct exynos_drm_connector *exynos_connector)
+{
+	struct exynos_panel *ctx = exynos_connector_to_panel(exynos_connector);
+	struct drm_connector *connector = &exynos_connector->base;
+	const char *sysfs_name = exynos_panel_get_sysfs_name(ctx);
+	struct drm_bridge *bridge = &ctx->bridge;
+	int ret;
+
+	ret = sysfs_create_link(&connector->kdev->kobj, &ctx->dev->kobj,
+				"panel");
+	if (ret)
+		dev_warn(ctx->dev, "unable to link panel sysfs (%d)\n", ret);
+
+	exynos_debugfs_panel_add(ctx, connector->debugfs_entry);
+	exynos_dsi_debugfs_add(to_mipi_dsi_device(ctx->dev), ctx->debugfs_entry);
+	panel_debugfs_add(ctx, ctx->debugfs_entry);
+
+	ret = sysfs_create_link(&bridge->dev->dev->kobj, &ctx->dev->kobj, sysfs_name);
+	if (ret)
+		dev_warn(ctx->dev, "unable to link %s sysfs (%d)\n", sysfs_name, ret);
+	else
+		dev_dbg(ctx->dev, "succeed to link %s sysfs\n", sysfs_name);
+}
+
 static int exynos_panel_bridge_attach(struct drm_bridge *bridge,
 				      enum drm_bridge_attach_flags flags)
 {
 	struct drm_device *dev = bridge->dev;
 	struct exynos_panel *ctx = bridge_to_exynos_panel(bridge);
 	struct drm_connector *connector = &ctx->exynos_connector.base;
-	const char *sysfs_name = exynos_panel_get_sysfs_name(ctx);
 	int ret;
 
 	ret = exynos_drm_connector_init(dev, &ctx->exynos_connector,
@@ -3404,8 +3443,6 @@ static int exynos_panel_bridge_attach(struct drm_bridge *bridge,
 
 	drm_connector_helper_add(connector, &exynos_connector_helper_funcs);
 
-	drm_connector_register(connector);
-
 	drm_connector_attach_encoder(connector, bridge->encoder);
 	connector->funcs->reset(connector);
 	connector->status = connector_status_connected;
@@ -3413,23 +3450,7 @@ static int exynos_panel_bridge_attach(struct drm_bridge *bridge,
 	if (ctx->desc->exynos_panel_func && ctx->desc->exynos_panel_func->commit_done)
 		ctx->exynos_connector.needs_commit = true;
 
-	ret = sysfs_create_link(&connector->kdev->kobj, &ctx->dev->kobj,
-				"panel");
-	if (ret)
-		dev_warn(ctx->dev, "unable to link panel sysfs (%d)\n", ret);
-
-	exynos_debugfs_panel_add(ctx, connector->debugfs_entry);
-	exynos_dsi_debugfs_add(to_mipi_dsi_device(ctx->dev), ctx->debugfs_entry);
-	panel_debugfs_add(ctx, ctx->debugfs_entry);
-
 	drm_kms_helper_hotplug_event(connector->dev);
-
-
-	ret = sysfs_create_link(&bridge->dev->dev->kobj, &ctx->dev->kobj, sysfs_name);
-	if (ret)
-		dev_warn(ctx->dev, "unable to link %s sysfs (%d)\n", sysfs_name, ret);
-	else
-		dev_dbg(ctx->dev, "succeed to link %s sysfs\n", sysfs_name);
 
 	return 0;
 }
@@ -3508,6 +3529,13 @@ static void exynos_panel_bridge_enable(struct drm_bridge *bridge,
 
 	if (need_update_backlight && ctx->bl)
 		backlight_update_status(ctx->bl);
+
+	if (!is_active && ctx->desc->exynos_panel_func &&
+	    ctx->desc->exynos_panel_func->run_normal_mode_work) {
+		dev_info(ctx->dev, "%s: schedule normal_mode_work\n", __func__);
+		schedule_delayed_work(&ctx->normal_mode_work,
+				      msecs_to_jiffies(ctx->normal_mode_work_delay_ms));
+	}
 }
 
 /*
@@ -3599,6 +3627,12 @@ static void exynos_panel_bridge_disable(struct drm_bridge *bridge,
 			ctx->panel_state = PANEL_STATE_BLANK;
 		} else {
 			ctx->panel_state = PANEL_STATE_OFF;
+
+			if (ctx->desc->exynos_panel_func &&
+			    ctx->desc->exynos_panel_func->run_normal_mode_work) {
+				dev_info(ctx->dev, "%s: cancel normal_mode_work\n", __func__);
+				cancel_delayed_work(&ctx->normal_mode_work);
+			}
 		}
 
 		drm_panel_disable(&ctx->panel);
@@ -4109,6 +4143,21 @@ static void exynos_panel_bridge_mode_set(struct drm_bridge *bridge,
 	if (need_update_backlight && ctx->bl)
 		backlight_update_status(ctx->bl);
 
+	/* we don't run normal_mode_work in LP mode */
+	if (funcs && funcs->run_normal_mode_work) {
+		if (pmode->exynos_mode.is_lp_mode) {
+			dev_info(ctx->dev, "%s: cancel normal_mode_work while entering LP mode\n",
+				 __func__);
+			cancel_delayed_work(&ctx->normal_mode_work);
+		} else if (old_mode && old_mode->exynos_mode.is_lp_mode &&
+			   ctx->panel_state == PANEL_STATE_NORMAL) {
+			dev_info(ctx->dev, "%s: schedule normal_mode_work while exiting LP mode\n",
+				 __func__);
+			schedule_delayed_work(&ctx->normal_mode_work,
+					      msecs_to_jiffies(ctx->normal_mode_work_delay_ms));
+		}
+	}
+
 	DPU_ATRACE_INT("panel_fps", drm_mode_vrefresh(mode));
 	DPU_ATRACE_END(__func__);
 }
@@ -4234,6 +4283,18 @@ static void local_hbm_post_work(struct kthread_work *work)
 	if (crtc)
 		drm_crtc_vblank_put(crtc);
 	DPU_ATRACE_END(__func__);
+}
+
+static void exynos_panel_normal_mode_work(struct work_struct *work)
+{
+	struct exynos_panel *ctx = container_of(work, struct exynos_panel, normal_mode_work.work);
+
+	dev_info(ctx->dev, "%s\n", __func__);
+	mutex_lock(&ctx->mode_lock);
+	ctx->desc->exynos_panel_func->run_normal_mode_work(ctx);
+	mutex_unlock(&ctx->mode_lock);
+	schedule_delayed_work(&ctx->normal_mode_work,
+			      msecs_to_jiffies(ctx->normal_mode_work_delay_ms));
 }
 
 static void hbm_data_init(struct exynos_panel *ctx)
@@ -4489,6 +4550,12 @@ int exynos_panel_common_init(struct mipi_dsi_device *dsi,
 
 	ctx->panel_idle_enabled = exynos_panel_func && exynos_panel_func->set_self_refresh != NULL;
 	INIT_DELAYED_WORK(&ctx->idle_work, panel_idle_work);
+
+	if (exynos_panel_func && exynos_panel_func->run_normal_mode_work &&
+	    ctx->desc->normal_mode_work_delay_ms) {
+		ctx->normal_mode_work_delay_ms = ctx->desc->normal_mode_work_delay_ms;
+		INIT_DELAYED_WORK(&ctx->normal_mode_work, exynos_panel_normal_mode_work);
+	}
 
 	mutex_init(&ctx->mode_lock);
 	mutex_init(&ctx->crtc_lock);

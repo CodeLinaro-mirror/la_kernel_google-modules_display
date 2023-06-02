@@ -25,6 +25,7 @@
 
 #include <linux/clk.h>
 #include <linux/console.h>
+#include <linux/errno.h>
 #include <linux/gpio/consumer.h>
 #include <linux/irq.h>
 #include <linux/of_address.h>
@@ -1294,7 +1295,9 @@ static const struct drm_encoder_funcs dsim_encoder_funcs = {
 static int dsim_add_mipi_dsi_device(struct dsim_device *dsim,
 	const char *pname, enum panel_priority_index idx)
 {
-	struct mipi_dsi_device_info *info = &dsim->dsi_device_info;
+	struct mipi_dsi_device_info info = {
+		.node = NULL,
+	};
 	struct device_node *node;
 	const char *name;
 	const char *dual_dsi;
@@ -1306,8 +1309,6 @@ static int dsim_add_mipi_dsi_device(struct dsim_device *dsim,
 
 	dsim_debug(dsim, "preferred panel is %.*s\n", cmp_len, pname);
 
-	info->node = NULL;
-
 	for_each_available_child_of_node(dsim->dsi_host.dev->of_node, node) {
 		bool found;
 
@@ -1316,8 +1317,8 @@ static int dsim_add_mipi_dsi_device(struct dsim_device *dsim,
 		 * abort panel detection in that case
 		 */
 		if (of_find_property(node, "reg", NULL)) {
-			if (info->node)
-				of_node_put(info->node);
+			if (info.node)
+				of_node_put(info.node);
 
 			return -ENODEV;
 		}
@@ -1326,10 +1327,10 @@ static int dsim_add_mipi_dsi_device(struct dsim_device *dsim,
 		 * We already detected panel we want but keep iterating
 		 * in case there are devices with reg property
 		 */
-		if (info->node)
+		if (info.node)
 			continue;
 
-		if (of_property_read_u32(node, "channel", &info->channel))
+		if (of_property_read_u32(node, "channel", &info.channel))
 			continue;
 
 		name = of_get_property(node, "label", NULL);
@@ -1344,16 +1345,16 @@ static int dsim_add_mipi_dsi_device(struct dsim_device *dsim,
 			 * index in the panel name, i.e. "priority-index:panel-name"
 			 */
 			if (found && idx > PANEL_PRIORITY_PRI_IDX)
-				scnprintf(info->type, sizeof(info->type),
+				scnprintf(info.type, sizeof(info.type),
 					"%d:%s", idx, name);
 			else
-				strlcpy(info->type, name, sizeof(info->type));
-			info->node = of_node_get(node);
+				strlcpy(info.type, name, sizeof(info.type));
+			info.node = of_node_get(node);
 		}
 	}
 
-	if (info->node) {
-		if (!of_property_read_string(info->node, "dual-dsi", &dual_dsi)) {
+	if (info.node) {
+		if (!of_property_read_string(info.node, "dual-dsi", &dual_dsi)) {
 			if (!strcmp(dual_dsi, "main"))
 				dsim->dual_dsi = DSIM_DUAL_DSI_MAIN;
 			else if (!strcmp(dual_dsi, "sec"))
@@ -1361,10 +1362,11 @@ static int dsim_add_mipi_dsi_device(struct dsim_device *dsim,
 			else
 				dsim->dual_dsi = DSIM_DUAL_DSI_NONE;
 		}
+		if (dsim->dual_dsi != DSIM_DUAL_DSI_SEC)
+			mipi_dsi_device_register_full(&dsim->dsi_host, &info);
 
 		if (dsim->dual_dsi == DSIM_DUAL_DSI_NONE)
 			panel_usage |= BIT(idx);
-
 		return 0;
 	}
 
@@ -1437,6 +1439,45 @@ static int dsim_parse_panel_name(struct dsim_device *dsim)
 	return -ENODEV;
 }
 
+static int dsim_attach_bridge(struct dsim_device *dsim)
+{
+	struct drm_bridge *bridge;
+	struct device_node *np;
+	int ret;
+
+	if (!dsim->dsi_device)
+		return -ENODEV;
+
+	np = dsim->dsi_device->dev.of_node;
+	if (!np)
+		return -ENOENT;
+
+	bridge = of_drm_find_bridge(np);
+	if (!bridge) {
+		struct drm_panel *panel;
+
+		panel = of_drm_find_panel(np);
+		if (IS_ERR(panel)) {
+			dsim_err(dsim, "failed to find panel\n");
+			return PTR_ERR(panel);
+		}
+
+		bridge = devm_drm_panel_bridge_add_typed(dsim->dev, panel, DRM_MODE_CONNECTOR_DSI);
+		if (IS_ERR(bridge)) {
+			dsim_err(dsim, "failed to create panel bridge\n");
+			return PTR_ERR(bridge);
+		}
+	}
+
+	ret = drm_bridge_attach(&dsim->encoder, bridge, NULL, 0);
+	if (ret)
+		dsim_err(dsim, "Unable to attach panel bridge\n");
+	else
+		dsim->panel_bridge = bridge;
+
+	return ret;
+}
+
 static int dsim_bind(struct device *dev, struct device *master, void *data)
 {
 	struct drm_encoder *encoder = dev_get_drvdata(dev);
@@ -1448,6 +1489,9 @@ static int dsim_bind(struct device *dev, struct device *master, void *data)
 
 	if (dsim->dual_dsi == DSIM_DUAL_DSI_SEC)
 		return 0;
+
+	if (!dsim->dsi_device)
+		return -EPROBE_DEFER;
 
 	drm_encoder_init(drm_dev, encoder, &dsim_encoder_funcs,
 			 DRM_MODE_ENCODER_DSI, NULL);
@@ -1461,8 +1505,7 @@ static int dsim_bind(struct device *dev, struct device *master, void *data)
 		return -ENOTSUPP;
 	}
 
-	mipi_dsi_device_register_full(&dsim->dsi_host, &dsim->dsi_device_info);
-	ret = mipi_dsi_host_register(&dsim->dsi_host);
+	ret = dsim_attach_bridge(dsim);
 
 	dsim_debug(dsim, "%s -\n", __func__);
 
@@ -1756,41 +1799,11 @@ static int dsim_host_attach(struct mipi_dsi_host *host,
 				  struct mipi_dsi_device *device)
 {
 	struct dsim_device *dsim = host_to_dsi(host);
-	struct drm_bridge *bridge;
 	int ret;
 
 	dsim_debug(dsim, "%s +\n", __func__);
 
-	bridge = of_drm_find_bridge(device->dev.of_node);
-	if (!bridge) {
-		struct drm_panel *panel;
-
-		panel = of_drm_find_panel(device->dev.of_node);
-		if (IS_ERR(panel)) {
-			dsim_err(dsim, "failed to find panel\n");
-			return PTR_ERR(panel);
-		}
-
-		bridge = devm_drm_panel_bridge_add_typed(host->dev, panel,
-						   DRM_MODE_CONNECTOR_DSI);
-		if (IS_ERR(bridge)) {
-			dsim_err(dsim, "failed to create panel bridge\n");
-			return PTR_ERR(bridge);
-		}
-	}
-
-	if (IS_ERR_OR_NULL(dsim->encoder.dev)) {
-		dsim_err(dsim, "encoder is not initialized\n");
-		return PTR_ERR(dsim->encoder.dev);
-	}
-
-	ret = drm_bridge_attach(&dsim->encoder, bridge, NULL, 0);
-	if (ret) {
-		dsim_err(dsim, "Unable to attach panel bridge\n");
-	} else {
-		dsim->panel_bridge = bridge;
-		dsim->dsi_device = device;
-	}
+	dsim->dsi_device = device;
 
 	ret = sysfs_create_link(&device->dev.kobj, &host->dev->kobj, "dsim");
 	if (ret)
@@ -1798,7 +1811,7 @@ static int dsim_host_attach(struct mipi_dsi_host *host,
 
 	dsim_debug(dsim, "%s -\n", __func__);
 
-	return ret;
+	return component_add(dsim->dev, &dsim_component_ops);
 }
 
 static int dsim_host_detach(struct mipi_dsi_host *host,
@@ -2715,8 +2728,22 @@ static int dsim_probe(struct platform_device *pdev)
 			phy_init(dsim->res.phy_ex);
 	}
 
+	if (dsim->dual_dsi == DSIM_DUAL_DSI_SEC) {
+		ret = component_add(dsim->dev, &dsim_component_ops);
+		if (ret < 0) {
+			dsim_err(dsim, "unable to add dsim component\n");
+			goto err;
+		}
+	} else {
+		ret = mipi_dsi_host_register(&dsim->dsi_host);
+		if (ret) {
+			dsim_err(dsim, "unable to register dsi host\n");
+			goto err;
+		}
+	}
+
 	dsim_info(dsim, "driver has been probed.\n");
-	return component_add(dsim->dev, &dsim_component_ops);
+	return 0;
 
 err:
 	dsim_err(dsim, "failed to probe exynos dsim driver\n");
