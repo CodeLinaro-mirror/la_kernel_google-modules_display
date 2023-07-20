@@ -2008,6 +2008,36 @@ static void exynos_panel_set_cabc(struct exynos_panel *ctx, enum exynos_cabc_mod
 	mutex_unlock(&ctx->mode_lock);
 }
 
+static void exynos_panel_lhbm_on_delay_frames(struct drm_crtc *crtc,
+						struct exynos_panel *ctx)
+{
+	u64 last_vblank_cnt = ctx->hbm.local_hbm.last_lp_vblank_cnt;
+
+	if (!ctx->desc->lhbm_on_delay_frames || !last_vblank_cnt)
+		return;
+
+	DPU_ATRACE_BEGIN("lhbm_on_delay_frames");
+	if (crtc && !drm_crtc_vblank_get(crtc)) {
+		int retry = ctx->desc->lhbm_on_delay_frames;
+
+		do {
+			u32 diff = 0;
+			u64 cur_vblank_cnt = drm_crtc_vblank_count(crtc);
+
+			if (cur_vblank_cnt > last_vblank_cnt)
+				diff = cur_vblank_cnt - last_vblank_cnt;
+
+			if (diff < ctx->desc->lhbm_on_delay_frames)
+				drm_crtc_wait_one_vblank(crtc);
+			else
+				break;
+		} while (--retry);
+		drm_crtc_vblank_put(crtc);
+	}
+	ctx->hbm.local_hbm.last_lp_vblank_cnt = 0;
+	DPU_ATRACE_END("lhbm_on_delay_frames");
+}
+
 static void exynos_panel_pre_commit_properties(
 				struct exynos_panel *ctx,
 				struct exynos_drm_connector_state *conn_state)
@@ -2035,8 +2065,12 @@ static void exynos_panel_pre_commit_properties(
 	if (mipi_sync) {
 		dev_info(ctx->dev, "%s: mipi_sync(0x%lx) pending_update_flags(0x%x)\n", __func__,
 			 conn_state->mipi_sync, conn_state->pending_update_flags);
+		if (conn_state->mipi_sync & MIPI_CMD_SYNC_LHBM)
+			exynos_panel_lhbm_on_delay_frames(conn_state->base.crtc, ctx);
+
 		exynos_panel_check_mipi_sync_timing(conn_state->base.crtc,
 						    ctx->current_mode, ctx);
+
 		exynos_dsi_dcs_write_buffer_force_batch_begin(dsi);
 	}
 
@@ -3564,66 +3598,68 @@ static int exynos_panel_bridge_atomic_check(struct drm_bridge *bridge,
 {
 	struct exynos_panel *ctx = bridge_to_exynos_panel(bridge);
 	struct drm_atomic_state *state = new_crtc_state->state;
-	struct drm_display_mode *target_mode;
 	const struct drm_display_mode *current_mode = &ctx->current_mode->mode;
 	const struct exynos_panel_funcs *funcs = ctx->desc->exynos_panel_func;
-	int current_vrefresh = drm_mode_vrefresh(current_mode);
-	int target_vrefresh;
 	int ret;
 
 	if (unlikely(!new_crtc_state))
 		return 0;
 
-	target_mode = &new_crtc_state->adjusted_mode;
-	target_vrefresh = drm_mode_vrefresh(target_mode);
+	if (unlikely(!current_mode)) {
+		dev_warn(ctx->dev, "%s: failed to get current mode, skip mode check\n", __func__);
+	} else {
+		struct drm_display_mode *target_mode = &new_crtc_state->adjusted_mode;
+		int current_vrefresh = drm_mode_vrefresh(current_mode);
+		int target_vrefresh = drm_mode_vrefresh(target_mode);
 
-	if (current_mode->hdisplay != target_mode->hdisplay &&
-	    current_mode->vdisplay != target_mode->vdisplay) {
-		if (current_vrefresh != target_vrefresh) {
-			/*
-			 * While switching resolution and refresh rate (from high to low) in the
-			 * same commit, the frame transfer time will become longer due to BTS update.
-			 * In the case, frame done time may cross to the next vsync, which will
-			 * hit DDIC’s constraint and cause the noises. Keep the current BTS
-			 * (higher one) for a few frames to avoid the problem.
-			 */
-			if (current_vrefresh > target_vrefresh) {
-				target_mode->clock =
-					target_mode->htotal * target_mode->vtotal *
-					current_vrefresh / 1000;
-				if (target_mode->clock != new_crtc_state->mode.clock) {
-					new_crtc_state->mode_changed = true;
-					dev_dbg(ctx->dev, "%s: keep mode (%s) clock %dhz on rrs\n",
-						__func__, target_mode->name, current_vrefresh);
+		if (current_mode->hdisplay != target_mode->hdisplay &&
+		    current_mode->vdisplay != target_mode->vdisplay) {
+			if (current_vrefresh != target_vrefresh) {
+				/*
+				 * While switching resolution and refresh rate (from high to low) in
+				 * the same commit, the frame transfer time will become longer due to
+				 * BTS update. In the case, frame done time may cross to the next
+				 * vsync, which will hit DDIC’s constraint and cause the noises. Keep
+				 * the current BTS (higher one) for a few frames to avoid the problem.
+				 */
+				if (current_vrefresh > target_vrefresh) {
+					target_mode->clock =
+						target_mode->htotal * target_mode->vtotal *
+						current_vrefresh / 1000;
+					if (target_mode->clock != new_crtc_state->mode.clock) {
+						new_crtc_state->mode_changed = true;
+						dev_dbg(ctx->dev, "%s: keep mode (%s) clock %dhz on rrs\n",
+							__func__, target_mode->name, current_vrefresh);
+					}
 				}
+
+				ctx->mode_in_progress = MODE_RES_AND_RR_IN_PROGRESS;
+			} else {
+				ctx->mode_in_progress = MODE_RES_IN_PROGRESS;
+			}
+		} else {
+			if (ctx->mode_in_progress == MODE_RES_AND_RR_IN_PROGRESS &&
+			    new_crtc_state->adjusted_mode.clock != new_crtc_state->mode.clock) {
+				new_crtc_state->mode_changed = true;
+				new_crtc_state->adjusted_mode.clock = new_crtc_state->mode.clock;
+				dev_dbg(ctx->dev, "%s: restore mode (%s) clock after rrs\n",
+					__func__, new_crtc_state->mode.name);
 			}
 
-			ctx->mode_in_progress = MODE_RES_AND_RR_IN_PROGRESS;
-		} else {
-			ctx->mode_in_progress = MODE_RES_IN_PROGRESS;
-		}
-	} else {
-		if (ctx->mode_in_progress == MODE_RES_AND_RR_IN_PROGRESS &&
-		    new_crtc_state->adjusted_mode.clock != new_crtc_state->mode.clock) {
-			new_crtc_state->mode_changed = true;
-			new_crtc_state->adjusted_mode.clock = new_crtc_state->mode.clock;
-			dev_dbg(ctx->dev, "%s: restore mode (%s) clock after rrs\n",
-				__func__, new_crtc_state->mode.name);
+			if (current_vrefresh != target_vrefresh)
+				ctx->mode_in_progress = MODE_RR_IN_PROGRESS;
+			else
+				ctx->mode_in_progress = MODE_DONE;
 		}
 
-		if (current_vrefresh != target_vrefresh)
-			ctx->mode_in_progress = MODE_RR_IN_PROGRESS;
-		else
-			ctx->mode_in_progress = MODE_DONE;
+		if (current_mode->hdisplay != target_mode->hdisplay ||
+		    current_mode->vdisplay != target_mode->vdisplay ||
+		    current_vrefresh != target_vrefresh)
+			dev_dbg(ctx->dev, "%s: current %dx%d@%d, target %dx%d@%d, type %d\n", __func__,
+				current_mode->hdisplay, current_mode->vdisplay, current_vrefresh,
+				target_mode->hdisplay, target_mode->vdisplay, target_vrefresh,
+				ctx->mode_in_progress);
 	}
-
-	if (current_mode->hdisplay != target_mode->hdisplay ||
-	    current_mode->vdisplay != target_mode->vdisplay ||
-	    current_vrefresh != target_vrefresh)
-		dev_dbg(ctx->dev, "%s: current %dx%d@%d, target %dx%d@%d, type %d\n", __func__,
-			current_mode->hdisplay, current_mode->vdisplay, current_vrefresh,
-			target_mode->hdisplay, target_mode->vdisplay, target_vrefresh,
-			ctx->mode_in_progress);
 
 	if (funcs && funcs->atomic_check) {
 		ret = funcs->atomic_check(ctx, state);
@@ -4148,6 +4184,13 @@ static void exynos_panel_bridge_mode_set(struct drm_bridge *bridge,
 				need_update_backlight = true;
 				state_changed = true;
 				come_out_lp_mode = true;
+
+				if (ctx->desc->lhbm_on_delay_frames &&
+					(crtc && !drm_crtc_vblank_get(crtc))) {
+					ctx->hbm.local_hbm.last_lp_vblank_cnt =
+							drm_crtc_vblank_count(crtc);
+					drm_crtc_vblank_put(crtc);
+				}
 			}
 			ctx->current_binned_lp = NULL;
 		} else if (funcs->mode_set) {
