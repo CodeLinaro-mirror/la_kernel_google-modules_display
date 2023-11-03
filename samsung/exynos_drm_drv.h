@@ -96,6 +96,7 @@ struct exynos_hdr_state {
  * Exynos drm plane state structure.
  *
  * @base: plane_state object (contains drm_framebuffer pointer)
+ * @old_fb: old drm_framebuffer pointer
  * @src: rectangle of the source image data to be displayed (clipped to
  *       visible part).
  * @crtc: rectangle of the target image position on hardware screen
@@ -109,6 +110,7 @@ struct exynos_hdr_state {
 
 struct exynos_drm_plane_state {
 	struct drm_plane_state base;
+	struct drm_framebuffer *old_fb;
 	uint32_t blob_id_restriction;
 	uint32_t max_luminance;
 	uint32_t min_luminance;
@@ -279,6 +281,8 @@ struct exynos_drm_crtc_state {
 	struct drm_rect partial_region;
 	struct drm_property_blob *partial;
 	bool needs_reconfigure;
+
+	struct kthread_work commit_work;
 };
 
 static inline struct exynos_drm_crtc_state *
@@ -319,6 +323,7 @@ struct exynos_drm_crtc {
 		struct drm_property *partial;
 		struct drm_property *cgc_lut_fd;
 		struct drm_property *expected_present_time;
+		struct drm_property *rcd_plane_id;
 	} props;
 	u8 active_state;
 	u32 rcd_plane_mask;
@@ -335,9 +340,6 @@ struct exynos_drm_pending_histogram_event {
 
 struct exynos_drm_priv_state {
 	struct drm_private_state base;
-
-	struct drm_atomic_state *old_state;
-	struct kthread_work commit_work;
 
 	unsigned int available_win_mask;
 };

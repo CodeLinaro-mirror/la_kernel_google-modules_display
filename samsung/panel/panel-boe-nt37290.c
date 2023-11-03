@@ -389,6 +389,21 @@ static const struct exynos_dsi_cmd nt37290_init_cmds[] = {
 	EXYNOS_DSI_CMD_SEQ_REV(PANEL_REV_DVT1, 0xF0, 0x55, 0xAA, 0x52, 0x08, 0x00),
 	EXYNOS_DSI_CMD_SEQ_REV(PANEL_REV_DVT1, 0x6F, 0x14),
 	EXYNOS_DSI_CMD_SEQ_REV(PANEL_REV_DVT1, 0xC2, 0x00, 0x50),
+	/* CMD2 Page 3: tune internal power on sequence */
+	EXYNOS_DSI_CMD_SEQ(0xF0, 0x55, 0xAA, 0x52, 0x08, 0x03),
+	EXYNOS_DSI_CMD_SEQ(0x6F, 0x10),
+	EXYNOS_DSI_CMD_SEQ(0xB6, 0x1F),
+	/* CMD2 Page 5: tune internal power on sequence */
+	EXYNOS_DSI_CMD_SEQ(0xF0, 0x55, 0xAA, 0x52, 0x08, 0x05),
+	EXYNOS_DSI_CMD_SEQ(0xB8, 0x04, 0x00, 0x00, 0x02),
+	EXYNOS_DSI_CMD_SEQ(0xB9, 0x04, 0x00, 0x00, 0x02),
+	EXYNOS_DSI_CMD_SEQ(0xBA, 0x84, 0x00, 0x00, 0x02),
+	/* CMD2 Page 3: tune internal power on sequence */
+	EXYNOS_DSI_CMD_SEQ(0xF0, 0x55, 0xAA, 0x52, 0x08, 0x03),
+	EXYNOS_DSI_CMD_SEQ(0x6F, 0x12),
+	EXYNOS_DSI_CMD_SEQ(0xD8, 0x14),
+	EXYNOS_DSI_CMD_SEQ(0x6F, 0x34),
+	EXYNOS_DSI_CMD_SEQ(0xB6, 0x0F, 0x00, 0x3C, 0x00, 0x3C, 0x00, 0x3C, 0x00, 0x3C),
 	/* CMD2 Page 8: IRC IP settings */
 	EXYNOS_DSI_CMD_SEQ_REV(PANEL_REV_DVT1, 0xF0, 0x55, 0xAA, 0x52, 0x08, 0x08),
 	EXYNOS_DSI_CMD_SEQ_REV(PANEL_REV_DVT1, 0x6F, 0x10),
@@ -397,6 +412,9 @@ static const struct exynos_dsi_cmd nt37290_init_cmds[] = {
 					       0x00),
 	EXYNOS_DSI_CMD_SEQ_REV(PANEL_REV_DVT1, 0x6F, 0x28),
 	EXYNOS_DSI_CMD_SEQ_REV(PANEL_REV_DVT1, 0xB8, 0x08, 0x00, 0x08, 0x00, 0x08, 0x00),
+	/* CMD2 Page 5: remove long TE2 pulse */
+	EXYNOS_DSI_CMD_SEQ(0xF0, 0x55, 0xAA, 0x52, 0x08, 0x05),
+	EXYNOS_DSI_CMD_SEQ(0xB6, 0x06, 0x03),
 
 	/* CMD3 Page 0 */
 	EXYNOS_DSI_CMD_SEQ(0xFF, 0xAA, 0x55, 0xA5, 0x80),
@@ -431,6 +449,8 @@ static const struct exynos_dsi_cmd nt37290_init_cmds[] = {
 	EXYNOS_DSI_CMD_SEQ_DELAY(120, 0x11),
 };
 static DEFINE_EXYNOS_CMD_SET(nt37290_init);
+
+static void nt37290_set_local_hbm_mode(struct exynos_panel *ctx, bool local_hbm_en);
 
 static u8 nt37290_get_te2_option(struct exynos_panel *ctx)
 {
@@ -749,8 +769,12 @@ static bool nt37290_set_self_refresh(struct exynos_panel *ctx, bool enable)
 		return false;
 
 	/* self refresh is not supported in lp mode since that always makes use of early exit */
-	if (pmode->exynos_mode.is_lp_mode)
+	if (pmode->exynos_mode.is_lp_mode) {
+		/* set 10Hz while self refresh is active, otherwise clear it */
+		ctx->panel_idle_vrefresh = enable ? 10 : 0;
+		backlight_state_changed(ctx->bl);
 		return false;
+	}
 
 	/* do not change frequency when LHBM is enabled */
 	if (ctx->hbm.local_hbm.enabled) {
@@ -872,7 +896,9 @@ static void nt37290_set_lp_mode(struct exynos_panel *ctx,
 	EXYNOS_DCS_BUF_ADD(ctx, 0x5A, 0x00);
 	EXYNOS_DCS_BUF_ADD_SET(ctx, cmd2_page0);
 	EXYNOS_DCS_BUF_ADD(ctx, 0x6F, 0x1C);
-	EXYNOS_DCS_BUF_ADD_AND_FLUSH(ctx, 0xBA, 0x95, 0x02, 0x02, 0x00, 0x11, 0x02, 0x02, 0x00);
+	EXYNOS_DCS_BUF_ADD(ctx, 0xBA, 0x95, 0x02, 0x02, 0x00, 0x11, 0x02, 0x02, 0x00);
+	/* make sure TE timing is no shift in AOD */
+	EXYNOS_DCS_BUF_ADD_AND_FLUSH(ctx, 0x44, 0x00, 0x00);
 
 	dev_dbg(ctx->dev, "%s: done\n", __func__);
 }
@@ -983,6 +1009,15 @@ static int nt37290_disable(struct drm_panel *panel)
 	bitmap_clear(spanel->hw_feat, 0, G10_FEAT_MAX);
 	spanel->hw_vrefresh = 60;
 	spanel->hw_idle_vrefresh = 0;
+
+	if (ctx->hbm.local_hbm.enabled) {
+		dev_warn(ctx->dev, "%s: lhbm is still enabled while disabling panel\n",
+			 __func__);
+		mutex_lock(&ctx->mode_lock);
+		/* disable lhbm immediately */
+		nt37290_set_local_hbm_mode(ctx, false);
+		mutex_unlock(&ctx->mode_lock);
+	}
 
 	return exynos_panel_disable(panel);
 }
@@ -1356,29 +1391,6 @@ static void nt37290_set_hbm_mode(struct exynos_panel *ctx,
 static void nt37290_set_local_hbm_mode(struct exynos_panel *ctx,
 				       bool local_hbm_en)
 {
-	const struct exynos_panel_mode *pmode;
-
-	if (ctx->hbm.local_hbm.enabled == local_hbm_en)
-		return;
-
-	pmode = ctx->current_mode;
-	if (unlikely(pmode == NULL)) {
-		dev_err(ctx->dev, "%s: unknown current mode\n", __func__);
-		return;
-	}
-
-	if (local_hbm_en) {
-		const int vrefresh = drm_mode_vrefresh(&pmode->mode);
-		/* Add check to turn on LHBM @ 120hz only to comply with HW requirement */
-		if (vrefresh != 120) {
-			dev_err(ctx->dev, "unexpected mode `%s` while enabling LHBM, give up\n",
-				pmode->mode.name);
-			return;
-		}
-	}
-
-	ctx->hbm.local_hbm.enabled = local_hbm_en;
-
 	if (local_hbm_en) {
 		if (ctx->panel_rev >= PANEL_REV_EVT1) {
 			struct nt37290_panel *spanel = to_spanel(ctx);
@@ -1416,9 +1428,6 @@ static void nt37290_set_local_hbm_mode(struct exynos_panel *ctx,
 static void nt37290_mode_set(struct exynos_panel *ctx,
 			     const struct exynos_panel_mode *pmode)
 {
-	if (!is_panel_active(ctx))
-		return;
-
 	nt37290_change_frequency(ctx, pmode);
 }
 

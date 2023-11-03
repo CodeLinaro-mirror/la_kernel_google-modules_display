@@ -49,6 +49,7 @@ enum decon_state {
 	DECON_STATE_ON,
 	DECON_STATE_HIBERNATION,
 	DECON_STATE_OFF,
+	DECON_STATE_HANDOVER,
 };
 
 enum dpu_win_state {
@@ -88,7 +89,8 @@ struct dpu_bts_win_config {
 	bool is_rot;
 	bool is_comp;
 	bool is_secure;
-	int dpp_ch;
+	u32 dpp_id;
+	u32 zpos;
 	u32 format;
 	u64 comp_src;
 };
@@ -140,7 +142,7 @@ struct dpu_bts {
 	u32 max_disp_freq;
 	u32 prev_max_disp_freq;
 	u32 dvfs_max_disp_freq;
-	u64 ppc;
+	u32 ppc;
 	u32 ppc_rotator;
 	u32 ppc_scaler;
 	u32 delay_comp;
@@ -154,6 +156,7 @@ struct dpu_bts {
 	u32 afbc_yuv_rt_util_pct;
 	u32 dfs_lv_cnt;
 	u32 dfs_lv_khz[BTS_DFS_MAX];
+	u32 max_dfs_lv_for_wb;
 	u32 vbp;
 	u32 vfp;
 	u32 vsa;
@@ -163,8 +166,7 @@ struct dpu_bts {
 	/* includes writeback dpp */
 	struct dpu_bts_bw rt_bw[MAX_DPP_CNT];
 
-	/* each decon must know other decon's BW to get overall BW */
-	u32 ch_bw[3][MAX_DECON_CNT];
+	u32 ch_bw[MAX_AXI_PORT];
 	int bw_idx;
 	struct dpu_bts_ops *ops;
 #if IS_ENABLED(CONFIG_EXYNOS_PM_QOS) || IS_ENABLED(CONFIG_EXYNOS_PM_QOS_MODULE)
@@ -194,6 +196,7 @@ enum dpu_event_type {
 	DPU_EVT_DECON_FRAMESTART,
 	DPU_EVT_DECON_RSC_OCCUPANCY,
 	DPU_EVT_DECON_TRIG_MASK,
+	DPU_EVT_DECON_UPDATE_CONFIG,
 
 	DPU_EVT_DSIM_ENABLED,
 	DPU_EVT_DSIM_DISABLED,
@@ -206,6 +209,7 @@ enum dpu_event_type {
 	DPU_EVT_DSIM_PL_FIFO_TIMEOUT,
 
 	DPU_EVT_DPP_FRAMEDONE,
+	DPU_EVT_DPP_SET_PROTECTION,
 	DPU_EVT_DMA_RECOVERY,
 
 	DPU_EVT_IDMA_AFBC_CONFLICT,
@@ -219,6 +223,12 @@ enum dpu_event_type {
 
 	DPU_EVT_DECON_RUNTIME_SUSPEND,
 	DPU_EVT_DECON_RUNTIME_RESUME,
+	DPU_EVT_DECON_SUSPEND,
+	DPU_EVT_DECON_RESUME,
+	DPU_EVT_DSIM_RUNTIME_SUSPEND,
+	DPU_EVT_DSIM_RUNTIME_RESUME,
+	DPU_EVT_DSIM_SUSPEND,
+	DPU_EVT_DSIM_RESUME,
 	DPU_EVT_ENTER_HIBERNATION_IN,
 	DPU_EVT_ENTER_HIBERNATION_OUT,
 	DPU_EVT_EXIT_HIBERNATION_IN,
@@ -263,6 +273,8 @@ enum dpu_event_type {
 	DPU_EVT_DIMMING_END,
 
 	DPU_EVT_CGC_FRAMEDONE,
+	DPU_EVT_ITMON_ERROR,
+	DPU_EVT_SYSMMU_FAULT,
 
 	DPU_EVT_MAX, /* End of EVENT */
 };
@@ -273,6 +285,7 @@ enum dpu_event_condition {
 	DPU_EVT_CONDITION_FAIL_UPDATE_BW	= 1U << 2,
 	DPU_EVT_CONDITION_FIFO_TIMEOUT		= 1U << 3,
 	DPU_EVT_CONDITION_IDMA_ERROR		= 1U << 4,
+	DPU_EVT_CONDITION_IDMA_ERROR_COMPACT	= 1U << 5,
 };
 
 #define DPU_CALLSTACK_MAX 10
@@ -288,16 +301,19 @@ struct dpu_log_dpp {
 	u32 win_id;
 	u64 comp_src;
 	u32 recovery_cnt;
+	pid_t last_secure_pid; /* record last PID which wrote mst_security */
+	bool mst_security;
 };
 
 struct dpu_log_win {
 	u32 win_idx;
 	u32 plane_idx;
+	bool secure;
 };
 
 struct dpu_log_rsc_occupancy {
-	u32 rsc_ch;
-	u32 rsc_win;
+	u64 rsc_ch;
+	u64 rsc_win;
 };
 
 struct dpu_log_atomic {
@@ -309,6 +325,8 @@ struct dpu_log_atomic {
 struct dpu_log_pd {
 	enum decon_state decon_state;
 	bool rpm_active;
+	enum dsim_state dsim_state;
+	bool dsim_rpm_active;
 };
 
 struct dpu_log_crtc_info {
@@ -318,6 +336,7 @@ struct dpu_log_crtc_info {
 	bool mode_changed;
 	bool active_changed;
 	bool self_refresh;
+	bool connectors_changed;
 };
 
 struct dpu_log_freqs {
@@ -369,8 +388,16 @@ struct dpu_log_plane_info {
 	u32 format;
 };
 
+struct dpu_log_decon_cfg {
+	u32 fps;
+	u32 image_width;
+	u32 image_height;
+	enum decon_out_type out_type;
+	struct decon_mode mode;
+};
+
 struct dpu_log {
-	ktime_t time;
+	u64 ts_nsec;
 	enum dpu_event_type type;
 
 	union {
@@ -387,6 +414,7 @@ struct dpu_log {
 		struct dpu_log_bts_event bts_event;
 		struct dpu_log_partial partial;
 		struct dpu_log_plane_info plane_info;
+		struct dpu_log_decon_cfg decon_cfg;
 		unsigned int value;
 	} data;
 };
@@ -444,6 +472,7 @@ struct decon_device {
 	struct kthread_work		buf_dump_work;
 	struct exynos_recovery		recovery;
 	struct exynos_dma		*cgc_dma;
+	struct exynos_fb_handover	fb_handover;
 
 	u32				irq_fs;	/* frame start irq number*/
 	u32				irq_fd;	/* frame done irq number*/
@@ -451,6 +480,7 @@ struct decon_device {
 	int				irq_te;
 	int				irq_ds;	/* dimming start irq number */
 	int				irq_de;	/* dimming end irq number */
+	int				te_gpio;
 	atomic_t			te_ref;
 	struct completion te_rising; /* signaled when irq_te is triggered */
 
@@ -468,6 +498,15 @@ struct decon_device {
 	struct exynos_partial *partial;
 };
 
+static inline struct decon_device *to_decon_device(const struct device *dev)
+{
+	/* could skip with dev_get_drvdata directly, but using pdev because
+	that's how drvdata was set originally */
+	struct platform_device *pdev = to_platform_device(dev);
+
+	return (struct decon_device *)platform_get_drvdata(pdev);
+}
+
 extern struct dpu_bts_ops dpu_bts_control;
 extern struct decon_device *decon_drvdata[MAX_DECON_CNT];
 
@@ -479,6 +518,7 @@ static inline struct decon_device *get_decon_drvdata(u32 id)
 	return NULL;
 }
 
+bool decon_dump_ignore(enum dpu_event_condition condition);
 void decon_dump(const struct decon_device *decon);
 void decon_dump_all(struct decon_device *decon,
 		enum dpu_event_condition cond, bool async_buf_dump);

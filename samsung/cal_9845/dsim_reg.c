@@ -18,6 +18,7 @@
 #include "regs-dsim.h"
 #include <dsim_cal.h>
 #include <cal_config.h>
+#include <soc/google/debug-snapshot.h>
 
 static struct cal_regs_desc regs_desc[REGS_DSIM_TYPE_MAX][MAX_DSI_CNT];
 
@@ -753,7 +754,14 @@ static void dsim_reg_set_pll(u32 id, u32 en)
 	dsim_phy_write_mask(id, DSIM_PHY_PLL_CON0, val, DSIM_PHY_PLL_EN_MASK);
 }
 
-static bool dsim_reg_is_pll_stable(u32 id)
+static bool dsim_reg_get_pll_en(u32 id)
+{
+	u32 val = dsim_phy_read(id, DSIM_PHY_PLL_CON0);
+
+	return !!(val & DSIM_PHY_PLL_EN_MASK);
+}
+
+bool dsim_reg_is_pll_stable(u32 id)
 {
 	u32 val, pll_lock;
 
@@ -772,7 +780,14 @@ static int dsim_reg_enable_pll(u32 id, u32 en)
 		dsim_reg_clear_int(id, DSIM_INTSRC_PLL_STABLE);
 
 	dsim_reg_set_pll(id, en);
+	if (en ^ dsim_reg_get_pll_en(id)) {
+		char dsim_msg[40];
 
+		scnprintf(dsim_msg, sizeof(dsim_msg),
+			"dsim%u: PLL_EN is not %sable\n", id, en ? "en" : "dis");
+		dbg_snapshot_emergency_reboot(dsim_msg);
+		return -EINVAL;
+	}
 	ret = readl_poll_timeout_atomic(
 			dphy_regs_desc(id)->regs + DSIM_PHY_PLL_STAT0,
 			val, en == DSIM_PHY_PLL_LOCK_GET(val), 10, 2000);
