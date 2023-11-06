@@ -64,6 +64,7 @@ struct dp_link {
 struct dp_host {
 	u32  link_rate;
 	u8   num_lanes;
+	u8   max_bpc;
 	u8   support_tps;
 	bool fast_training;
 	bool enhanced_frame;
@@ -94,9 +95,10 @@ struct dp_sink {
 	u32  edid_product;
 	u32  edid_serial;
 
-	u32 audio_ch_num;
-	u32 audio_sample_rates;
-	u32 audio_bit_rates;
+	bool has_pcm_audio;
+	u8 audio_ch_num;
+	u8 audio_sample_rates;
+	u8 audio_bit_rates;
 };
 
 struct dp_resources {
@@ -133,7 +135,12 @@ enum dp_state_for_hdcp22 {
 	DP_CONNECT,
 };
 
-enum link_training_status { LINK_TRAINING_UNKNOWN, LINK_TRAINING_SUCCESS, LINK_TRAINING_FAILURE };
+enum link_training_status {
+	LINK_TRAINING_UNKNOWN,
+	LINK_TRAINING_SUCCESS,
+	LINK_TRAINING_FAILURE,
+	LINK_TRAINING_FAILURE_SINK,
+};
 
 /* DisplayPort Device */
 struct dp_device {
@@ -157,6 +164,7 @@ struct dp_device {
 	/* HPD State */
 	enum hotplug_state hpd_current_state;
 	struct mutex hpd_state_lock;
+	int dp_hotplug_error_code;
 
 	/* DP Driver State */
 	enum dp_state state;
@@ -164,16 +172,20 @@ struct dp_device {
 	/* DRM Mode */
 	int cur_mode_vic; /* VIC number of cur_mode */
 	struct drm_display_mode cur_mode;
-	struct drm_display_mode pref_mode;
-	bool fail_safe;
+	int num_modes;
+	int num_sads;
 
 	/* DP Capabilities */
 	struct dp_link link;
 	struct dp_host host;
 	struct dp_sink sink;
 
+	/* DP Branch Device support */
+	int sink_count;
+	int dfp_count;
+
 	/* BIST */
-	bool bist_used;
+	int bist_mode;
 
 	/* Audio */
 	enum dp_audio_state audio_state;
@@ -187,6 +199,11 @@ struct dp_device {
 	enum plug_orientation typec_orientation;
 	enum pin_assignment typec_pin_assignment;
 	enum link_training_status typec_link_training_status;
+
+	/* DP Link CRCs enabled */
+	bool dp_link_crc_enabled;
+	struct dentry *dp_crc_enabled_debugfs_file;
+	struct dentry *dp_crc_values_debugfs_file;
 };
 
 static inline struct dp_device *get_dp_drvdata(void)

@@ -1,0 +1,42 @@
+What:		/sys/devices/platform/110f0000.drmdp/drm-displayport/hpd
+Date:		August 2023
+KernelVersion:	5.15
+Contact:	"Petri Gynther" <pgynther@google.com>
+Description:
+		USB HAL uses this interface to report HPD events.
+
+What:		/sys/devices/platform/110f0000.drmdp/drm-displayport/irq_hpd
+Date:		August 2023
+KernelVersion:	5.15
+Contact:	"Petri Gynther" <pgynther@google.com>
+Description:
+		USB HAL uses this interface to report IRQ_HPD events.
+
+What:		/sys/devices/platform/110f0000.drmdp/drm-displayport/link_status
+Date:		August 2023
+KernelVersion:	5.15
+Contact:	"Petri Gynther" <pgynther@google.com>
+Description:
+		USB HAL uses this interface to check on DP link status.
+
+What:		/sys/devices/platform/110f0000.drmdp/drm-displayport/orientation
+Date:		August 2023
+KernelVersion:	5.15
+Contact:	"Petri Gynther" <pgynther@google.com>
+Description:
+		USB HAL uses this interface to report DP cable orientation.
+
+What:		/sys/devices/platform/110f0000.drmdp/drm-displayport/pin_assignment
+Date:		August 2023
+KernelVersion:	5.15
+Contact:	"Petri Gynther" <pgynther@google.com>
+Description:
+		USB HAL uses this interface to report DP cable pin assignment.
+
+What:          /sys/devices/platform/110f0000.drmdp/drm-displayport/dp_hotplug_error_code
+Date:          September 2023
+KernelVersion: 5.15
+Contact:       "Sergey Volk" <servolk@google.com>
+Description:
+               Used to pass error code associated with a hotplug event sent to client.
+               Zero indicates successful hotplug event, non-zero value indicates hotplug failure.

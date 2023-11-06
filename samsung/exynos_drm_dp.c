@@ -95,7 +95,7 @@ static void dp_init_info(struct dp_device *dp)
 	dp->hpd_current_state = EXYNOS_HPD_UNPLUG;
 	dp->audio_state = DP_AUDIO_DISABLE;
 	dp->output_type = EXYNOS_DISPLAY_TYPE_DP0_SST1;
-	dp->bist_used = false;
+	dp->dp_link_crc_enabled = false;
 }
 
 static u32 dp_get_max_link_rate(struct dp_device *dp)
@@ -136,13 +136,25 @@ static bool dp_get_fast_training(struct dp_device *dp)
 #define DP_LINK_RATE_HBR2 2
 #define DP_LINK_RATE_HBR3 3
 
-static unsigned long dp_rate = DP_LINK_RATE_HBR2;    /* HBR2 is the default */
+static unsigned long dp_rate = DP_LINK_RATE_RBR;    /* RBR is the default */
 module_param(dp_rate, ulong, 0664);
 MODULE_PARM_DESC(dp_rate, "use specific DP link rate by setting dp_rate=x");
 
 static unsigned long dp_lanes = 4;    /* 4 lanes is the default */
 module_param(dp_lanes, ulong, 0664);
 MODULE_PARM_DESC(dp_lanes, "use specific number of DP lanes by setting dp_lanes=x");
+
+static unsigned long dp_bpc = 8;    /* 8 bpc is the default */
+module_param(dp_bpc, ulong, 0664);
+MODULE_PARM_DESC(dp_bpc, "use specific BPC by setting dp_bpc=x");
+
+#define DP_BIST_OFF     0
+#define DP_BIST_ON      1
+#define DP_BIST_ON_HDCP 2
+
+static unsigned long dp_bist_mode = DP_BIST_OFF;
+module_param(dp_bist_mode, ulong, 0664);
+MODULE_PARM_DESC(dp_bist_mode, "use BIST mode by setting dp_bist_mode=x");
 
 static void dp_fill_host_caps(struct dp_device *dp)
 {
@@ -172,6 +184,32 @@ static void dp_fill_host_caps(struct dp_device *dp)
 	case 4:
 	default:
 		dp->host.num_lanes = 4;
+		break;
+	}
+
+	switch (dp_bpc) {
+	case 10:
+		dp->host.max_bpc = 10;
+		break;
+	case 8:
+		dp->host.max_bpc = 8;
+		break;
+	case 6:
+	default:
+		dp->host.max_bpc = 6;
+		break;
+	}
+
+	switch (dp_bist_mode) {
+	case DP_BIST_ON_HDCP:
+		dp->bist_mode = DP_BIST_ON_HDCP;
+		break;
+	case DP_BIST_ON:
+		dp->bist_mode = DP_BIST_ON;
+		break;
+	case DP_BIST_OFF:
+	default:
+		dp->bist_mode = DP_BIST_OFF;
 		break;
 	}
 
@@ -250,22 +288,6 @@ static int dp_get_edid_block(void *data, u8 *edid, unsigned int block,
 
 //------------------------------------------------------------------------------
 //
-static int dp_check_dp_sink(struct dp_device *dp)
-{
-	int sink_count = drm_dp_read_sink_count(&dp->dp_aux);
-
-	if (sink_count < 0) {
-		dp_err(dp, "failed to read DP Sink count\n");
-		return sink_count;
-	} else if (sink_count > 2) {
-		// Now, only 1 DP Sink should be supported.
-		dp_err(dp, "DP sink count is %d\n", sink_count);
-		return -EPERM;
-	}
-
-	return 0;
-}
-
 static int dp_sink_power_up(struct dp_device *dp, bool up)
 {
 	u8 val = 0;
@@ -508,6 +530,18 @@ static bool dp_do_link_training_cr(struct dp_device *dp, u32 interval_us)
 					  &max_swing_reached, lanes_data,
 					  link_status);
 
+		if (cr_done) {
+			dp_info(dp, "CR Done. Move to Training_EQ.\n");
+			return true;
+		}
+
+		fail_counter_long++;
+
+		/*
+		 * Per DP spec, if the sink requests adjustment to
+		 * max voltage swing or max pre-emphasis value, it
+		 * will be retried only once.
+		 */
 		if (max_swing_reached) {
 			if (!try_max_swing) {
 				dp_info(dp, "adjust to max swing level\n");
@@ -519,13 +553,11 @@ static bool dp_do_link_training_cr(struct dp_device *dp, u32 interval_us)
 			}
 		}
 
-		if (cr_done) {
-			dp_info(dp, "CR Done. Move to Training_EQ.\n");
-			return true;
-		}
-
-		fail_counter_long++;
-
+		/*
+		 * Per DP spec, if the sink requests the exact same
+		 * voltage swing and pre-emphasis levels again, it
+		 * will be retried only max 5 times.
+		 */
 		if (same_before_adjust) {
 			dp_info(dp, "requested same level. Retry...\n");
 			fail_counter_short++;
@@ -575,7 +607,7 @@ static bool dp_do_link_training_eq(struct dp_device *dp, u32 interval_us,
 	u8 lanes_data[MAX_LANE_CNT]; // before_cr
 	u8 link_status[DP_LINK_STATUS_SIZE]; // after_cr
 	bool cr_done;
-	bool same_before_adjust, max_swing_reached, try_max_swing = false;
+	bool same_before_adjust, max_swing_reached = false;
 	u8 fail_counter = 0;
 	int i;
 
@@ -609,28 +641,18 @@ static bool dp_do_link_training_eq(struct dp_device *dp, u32 interval_us,
 					  &max_swing_reached, lanes_data,
 					  link_status);
 
-		if (max_swing_reached) {
-			if (!try_max_swing) {
-				dp_info(dp, "adjust to max swing level\n");
-				try_max_swing = true;
-				continue;
-			} else {
-				dp_err(dp, "reached max swing level\n");
-				goto err;
-			}
-		}
-
 		if (cr_done) {
-			if (drm_dp_channel_eq_ok(link_status,
-						 dp->link.num_lanes)) {
-				dp_info(dp,
-					"EQ Done. Move to Training_Done.\n");
+			if (drm_dp_channel_eq_ok(link_status, dp->link.num_lanes)) {
+				dp_info(dp, "EQ Done. Move to Training_Done.\n");
 				return true;
 			}
+		} else {
+			dp_err(dp, "CR failed during EQ phase\n");
+			goto err;
 		}
 
 		fail_counter++;
-	} while (fail_counter < 5);
+	} while (fail_counter < 6);
 
 err:
 	dp_err(dp, "failed Link Training EQ phase with BW(%u) and Lanes(%u)\n",
@@ -669,6 +691,14 @@ static int dp_do_full_link_training(struct dp_device *dp, u32 interval_us)
 					"reducing link rate to %u during CR phase\n",
 					dp->link.link_rate);
 				continue;
+			} else if (dp->link.num_lanes > 1) {
+				dp->link.num_lanes >>= 1;
+				dp->link.link_rate = dp_get_max_link_rate(dp);
+
+				dp_info(dp,
+					"reducing lanes number to %u during CR phase\n",
+					dp->link.num_lanes);
+				continue;
 			}
 
 			dp_err(dp, "Link training failed during CR phase\n");
@@ -684,6 +714,14 @@ static int dp_do_full_link_training(struct dp_device *dp, u32 interval_us)
 				dp_info(dp,
 					"reducing link rate to %u during EQ phase\n",
 					dp->link.link_rate);
+				continue;
+			} else if (dp->link.num_lanes > 1) {
+				dp->link.num_lanes >>= 1;
+				dp->link.link_rate = dp_get_max_link_rate(dp);
+
+				dp_info(dp,
+					"reducing lanes number to %u during EQ phase\n",
+					dp->link.num_lanes);
 				continue;
 			}
 
@@ -714,38 +752,103 @@ err:
 
 static int dp_link_up(struct dp_device *dp)
 {
-	u8 dpcd[DP_RECEIVER_CAP_SIZE];
+	u8 dpcd[DP_RECEIVER_CAP_SIZE + 1];
+	u8 dsc_dpcd[DP_DSC_RECEIVER_CAP_SIZE];
+	u8 dfp_info[DP_MAX_DOWNSTREAM_PORTS];
 	u8 val = 0;
-	unsigned int addr;
 	u32 interval, interval_us;
 	int ret;
 
 	mutex_lock(&dp->training_lock);
 
-	// Read DP Sink device's Capabilities
-	drm_dp_dpcd_readb(&dp->dp_aux, DP_TRAINING_AUX_RD_INTERVAL, &val);
-	if (val & DP_EXTENDED_RECEIVER_CAP_FIELD_PRESENT)
-		addr = DP_DP13_DPCD_REV;
-	else
-		addr = DP_DPCD_REV;
+	/* Fill host capabilities again, as they can be modified via sysfs */
+	dp_fill_host_caps(dp);
 
-	ret = drm_dp_dpcd_read(&dp->dp_aux, addr, dpcd, DP_RECEIVER_CAP_SIZE);
+	/* Update max BPC settings */
+	dp->connector.max_bpc_property->values[1] = dp->host.max_bpc;
+	dp->connector.state->max_bpc = dp->host.max_bpc;
+	dp->connector.state->max_requested_bpc = dp->host.max_bpc;
+
+	/* Read DP Sink device's Capabilities */
+	ret = drm_dp_dpcd_read(&dp->dp_aux, DP_DPCD_REV, dpcd, DP_RECEIVER_CAP_SIZE + 1);
 	if (ret < 0) {
 		dp_err(dp, "failed to read DP Sink device capabilities\n");
 		mutex_unlock(&dp->training_lock);
-		return ret;
+		return -EIO;
 	}
 
-	// Fill Sink Capabilities
+	if (dpcd[DP_TRAINING_AUX_RD_INTERVAL] & DP_EXTENDED_RECEIVER_CAP_FIELD_PRESENT) {
+		ret = drm_dp_dpcd_read(&dp->dp_aux, DP_DP13_DPCD_REV, dpcd,
+				       DP_RECEIVER_CAP_SIZE + 1);
+		if (ret < 0) {
+			dp_err(dp, "failed to read DP Sink device capabilities\n");
+			mutex_unlock(&dp->training_lock);
+			return -EIO;
+		}
+	}
+
+	/* Fill Sink Capabilities */
 	dp_fill_sink_caps(dp, dpcd);
 	dp_info(dp, "DP Sink: DPCD_Rev_%X, Rate(%u Mbps), Lanes(%u)\n",
 		dp->sink.revision, dp->sink.link_rate / 100,
 		dp->sink.num_lanes);
 
-	// Power DP Sink device Up
+	/* Power DP Sink device Up */
 	dp_sink_power_up(dp, true);
 
-	// Pick link parameters
+	/* Check DSC & FEC support */
+	ret = drm_dp_dpcd_read(&dp->dp_aux, DP_DSC_SUPPORT, dsc_dpcd, DP_DSC_RECEIVER_CAP_SIZE);
+	if (ret < 0)
+		dp_warn(dp, "DP Sink: failed to read DSC support register\n");
+	else
+		dp_info(dp, "DP Sink: DSC support: %02x revision: %02x\n",
+			dsc_dpcd[0], dsc_dpcd[1]);
+
+	ret = drm_dp_dpcd_readb(&dp->dp_aux, DP_FEC_CAPABILITY, &val);
+	if (ret < 0)
+		dp_warn(dp, "DP Sink: failed to read FEC support register\n");
+	else
+		dp_info(dp, "DP Sink: FEC support: %02x\n", val);
+
+	/* Get sink count */
+	dp->sink_count = drm_dp_read_sink_count(&dp->dp_aux);
+	if (dp->sink_count < 0) {
+		dp_err(dp, "DP Sink: failed to read sink count\n");
+		mutex_unlock(&dp->training_lock);
+		return -EIO;
+	}
+
+	/* Get DFP count */
+	if (dpcd[DP_DOWNSTREAMPORT_PRESENT] & DP_DWN_STRM_PORT_PRESENT) {
+		dp->dfp_count = dpcd[DP_DOWN_STREAM_PORT_COUNT] & DP_PORT_COUNT_MASK;
+		ret = drm_dp_dpcd_read(&dp->dp_aux, DP_DOWNSTREAM_PORT_0, dfp_info,
+				       DP_MAX_DOWNSTREAM_PORTS);
+		if (ret < 0) {
+			dp_err(dp, "DP Branch Device: failed to read DP Downstream Port info\n");
+			mutex_unlock(&dp->training_lock);
+			return -EIO;
+		}
+
+		dp_info(dp, "DP Branch Device: DFP count = %d, sink count = %d\n",
+			dp->dfp_count, dp->sink_count);
+	} else {
+		dp->dfp_count = 0;
+		dp_info(dp, "DP Sink: sink count = %d\n", dp->sink_count);
+	}
+
+	if (dp->sink_count == 0) {
+		if (dp->dfp_count > 0) {
+			dp_info(dp, "DP Link: training defer: DP Branch Device, sink count = 0\n");
+			mutex_unlock(&dp->training_lock);
+			return 0;
+		} else {
+			dp_err(dp, "DP Sink: invalid sink count = 0\n");
+			mutex_unlock(&dp->training_lock);
+			return -EINVAL;
+		}
+	}
+
+	/* Pick link parameters */
 	dp->link.link_rate = dp_get_max_link_rate(dp);
 	dp->link.num_lanes = dp_get_max_num_lanes(dp);
 	dp->link.enhanced_frame = dp_get_enhanced_mode(dp);
@@ -755,13 +858,13 @@ static int dp_link_up(struct dp_device *dp)
 	dp_info(dp, "DP Link: training start: Rate(%u Mbps) and Lanes(%u)\n",
 		dp->link.link_rate / 100, dp->link.num_lanes);
 
-	// Link Training
+	/* Link Training */
 	interval = dpcd[DP_TRAINING_AUX_RD_INTERVAL] & DP_TRAINING_AUX_RD_MASK;
 	interval_us = dp_get_training_interval_us(dp, interval);
 	if (!interval_us || dp_do_full_link_training(dp, interval_us)) {
 		dp_err(dp, "failed to train DP Link\n");
 		mutex_unlock(&dp->training_lock);
-		return -EIO;
+		return -ENOLINK;
 	}
 
 	mutex_unlock(&dp->training_lock);
@@ -782,13 +885,22 @@ static enum bit_depth dp_get_bpc(struct dp_device *dp)
 	struct drm_connector *connector = &dp->connector;
 	struct drm_display_info *display_info = &connector->display_info;
 
-	dp_info(dp, "display_info->bpc = %u\n", display_info->bpc);
-
 	/*
-	 * For now, force DP to use bpc = 8.
-	 * TODO: Revisit this later for DP HDR support.
+	 * drm_atomic_connector_check() has been called.
+	 * We can use connector->state->max_bpc directly.
 	 */
-	return BPC_8;
+	u8 bpc = connector->state->max_bpc;
+
+	dp_info(dp, "display_info->bpc = %u, bpc = %u\n", display_info->bpc, bpc);
+
+	switch (bpc) {
+	case 10:
+		return BPC_10;
+	case 8:
+		return BPC_8;
+	default:
+		return BPC_6;
+	}
 }
 
 static void dp_set_video_timing(struct dp_device *dp)
@@ -925,23 +1037,26 @@ static void dp_enable(struct drm_encoder *encoder)
 	dp->hw_config.range = VESA_RANGE;
 	dp_set_video_timing(dp);
 
-	if (dp->bist_used) {
+	if (dp->bist_mode == DP_BIST_OFF) {
+		dp_hw_set_video_config(&dp->hw_config);
+	} else {
+		/* BIST mode */
 		dp->hw_config.bist_mode = true;
 		dp->hw_config.bist_type = COLOR_BAR;
-
 		dp_hw_set_bist_video_config(&dp->hw_config);
-	} else
-		dp_hw_set_video_config(&dp->hw_config);
+	}
 
 	dp_set_avi_infoframe(dp);
 	dp_set_spd_infoframe();
 
+	dp->dp_link_crc_enabled = false;
 	enable_irq(dp->res.irq);
 	dp_hw_start();
 	dp_info(dp, "enabled DP as cur_mode = %s@%d\n", dp->cur_mode.name,
 		drm_mode_vrefresh(&dp->cur_mode));
 
-	if (dp->bist_used) {
+	if (dp->bist_mode != DP_BIST_OFF) {
+		/* BIST mode */
 		dp->hw_config.num_audio_ch = dp->sink.audio_ch_num;
 		// To remove HDMI_AUDIO_SAMPLE_FREQUENCY_STREAM, minus 1
 		dp->hw_config.audio_fs = dp->sink.audio_sample_rates - 1;
@@ -970,7 +1085,8 @@ static void dp_disable(struct drm_encoder *encoder)
 
 	if (dp->state == DP_STATE_RUN) {
 		disable_irq(dp->res.irq);
-		if (dp->bist_used) {
+		if (dp->bist_mode != DP_BIST_OFF) {
+			/* BIST mode */
 			dp_hw_stop_audio();
 			dp_hw_deinit_audio();
 		}
@@ -991,6 +1107,9 @@ static void dp_parse_edid(struct dp_device *dp, struct edid *edid)
 	u8 *edid_vendor = dp->sink.edid_manufacturer;
 	u32 edid_prod_id = 0;
 
+	if (edid == NULL)
+		return;
+
 	edid_vendor[0] = ((edid->mfg_id[0] & 0x7c) >> 2) + '@';
 	edid_vendor[1] = (((edid->mfg_id[0] & 0x3) << 3) |
 			  ((edid->mfg_id[1] & 0xe0) >> 5)) +
@@ -1004,10 +1123,10 @@ static void dp_parse_edid(struct dp_device *dp, struct edid *edid)
 
 	drm_edid_get_monitor_name(edid, dp->sink.sink_name, SINK_NAME_LEN);
 
-	dp_info(dp, "Sink Manufacturer: %s\n", dp->sink.edid_manufacturer);
-	dp_info(dp, "Sink Product: %x\n", dp->sink.edid_product);
-	dp_info(dp, "Sink Serial: %x\n", dp->sink.edid_serial);
-	dp_info(dp, "Sink Name: %s\n", dp->sink.sink_name);
+	dp_info(dp, "EDID: Sink Manufacturer: %s\n", dp->sink.edid_manufacturer);
+	dp_info(dp, "EDID: Sink Product: %x\n", dp->sink.edid_product);
+	dp_info(dp, "EDID: Sink Serial: %x\n", dp->sink.edid_serial);
+	dp_info(dp, "EDID: Sink Name: %s\n", dp->sink.sink_name);
 }
 
 static void dp_clean_drm_modes(struct dp_device *dp)
@@ -1016,7 +1135,6 @@ static void dp_clean_drm_modes(struct dp_device *dp)
 	struct drm_connector *connector = &dp->connector;
 
 	memset(&dp->cur_mode, 0, sizeof(struct drm_display_mode));
-	memset(&dp->pref_mode, 0, sizeof(struct drm_display_mode));
 
 	list_for_each_entry_safe (mode, t, &connector->probed_modes, head) {
 		list_del(&mode->head);
@@ -1024,7 +1142,7 @@ static void dp_clean_drm_modes(struct dp_device *dp)
 	}
 }
 
-static const struct drm_display_mode mode_vga[1] = {
+static const struct drm_display_mode failsafe_mode[1] = {
 	/* 1 - 640x480@60Hz 4:3 */
 	{
 		DRM_MODE("640x480", DRM_MODE_TYPE_DRIVER, 25175, 640, 656, 752,
@@ -1034,97 +1152,102 @@ static const struct drm_display_mode mode_vga[1] = {
 	}
 };
 
-static void dp_mode_set_fail_safe(struct dp_device *dp)
-{
-	dp->hw_config.bpc = BPC_6;
-	drm_mode_copy(&dp->cur_mode, mode_vga);
-	dp->fail_safe = true;
-}
-
-static bool dp_find_prefer_mode(struct dp_device *dp)
-{
-	struct drm_display_mode *mode, *t;
-	struct drm_connector *connector = &dp->connector;
-	bool found = false;
-
-	list_for_each_entry_safe (mode, t, &connector->probed_modes, head) {
-		if ((mode->type & DRM_MODE_TYPE_PREFERRED)) {
-			dp_info(dp,
-				"pref: %s@%d, type: %d, stat: %d, ratio: %d\n",
-				mode->name, drm_mode_vrefresh(mode), mode->type,
-				mode->status, mode->picture_aspect_ratio);
-			drm_mode_copy(&dp->pref_mode, mode);
-			drm_mode_copy(&dp->cur_mode, mode);
-			found = true;
-			break;
-		}
-	}
-
-	if (!found) {
-		dp_info(dp, "there are no valid mode, fail-safe\n");
-		dp_mode_set_fail_safe(dp);
-	}
-
-	return found;
-}
-
-static void dp_sad_to_audio_info(struct dp_device *dp, struct cea_sad *sads, int num)
+static void dp_sad_to_audio_info(struct dp_device *dp, struct cea_sad *sads)
 {
 	int i;
 
+	dp->sink.has_pcm_audio = false;
+
 	/* enum hdmi_audio_coding_type & enum hdmi_audio_sample_frequency are defined in hdmi.h */
-	for (i = 0; i < num; i++) {
-		dp_info(dp, "audio format: %u, ch: %u, freq: %u, byte2: 0x%08X\n",
-			sads[i].format, sads[i].channels, sads[i].freq, sads[i].byte2);
+	for (i = 0; i < dp->num_sads; i++) {
+		dp_info(dp, "EDID: SAD %d: fmt: 0x%02x, ch: 0x%02x, freq: 0x%02x, byte2: 0x%02x\n",
+			i + 1, sads[i].format, sads[i].channels, sads[i].freq, sads[i].byte2);
 
 		if (sads[i].format == HDMI_AUDIO_CODING_TYPE_PCM) {
-			dp->sink.audio_ch_num |= 1 << sads[i].channels;
-			dp->sink.audio_sample_rates |= sads[i].freq;
-			dp->sink.audio_bit_rates |= sads[i].byte2;
+			dp->sink.has_pcm_audio = true;
+			dp->sink.audio_ch_num = sads[i].channels + 1;
+			dp->sink.audio_sample_rates = sads[i].freq;
+			dp->sink.audio_bit_rates = sads[i].byte2;
 		}
 	}
-	dp_info(dp, "HDMI Audio ch: %u, sample_rates: %u, bit_rates: %u bps\n",
-		dp->sink.audio_ch_num, dp->sink.audio_sample_rates, dp->sink.audio_bit_rates);
+
+	if (dp->sink.has_pcm_audio)
+		dp_info(dp, "EDID: PCM audio: ch: %u, sample_rates: 0x%02x, bit_rates: 0x%02x\n",
+			dp->sink.audio_ch_num, dp->sink.audio_sample_rates,
+			dp->sink.audio_bit_rates);
 }
+
+static const u8 dp_fake_edid[EDID_LENGTH] = {
+	/* header */
+	0x0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x0,
+	/* vendor/product info */
+	0x1d, 0xef, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0xff, 0x21,
+	/* EDID version */
+	0x1, 0x2,
+	/* basic display parameters */
+	0xa5, 0x46, 0x27, 0x78, 0x0,
+	/* color characteristics */
+	0xba, 0xc5, 0xa9, 0x53, 0x4e, 0xa6, 0x25, 0xe, 0x50, 0x54,
+	/* established timings: 640x480 @ 60 */
+	0x20, 0x0, 0x0,
+	/* standard timings: none */
+	0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1,
+	0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1,
+	/* detailed timings: none */
+	0x0, 0x0, 0x0, 0x10, 0x0, 0x0, 0x0, 0x0,
+	0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+	0x0, 0x0, 0x0, 0x10, 0x0, 0x0, 0x0, 0x0,
+	0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+	0x0, 0x0, 0x0, 0x10, 0x0, 0x0, 0x0, 0x0,
+	0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+	0x0, 0x0, 0x0, 0x10, 0x0, 0x0, 0x0, 0x0,
+	0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+	/* extension flag + checksum */
+	0x0, 0x97,
+};
 
 static void dp_on_by_hpd_plug(struct dp_device *dp)
 {
 	struct drm_connector *connector = &dp->connector;
 	struct drm_device *dev = connector->dev;
+	struct edid *edid;
+	struct cea_sad *sads;
+	struct drm_display_mode *fs_mode;
 
-	if (dp->bist_used) {
-		/* Parse EDID for BIST video/audio */
-		struct edid *edid =
-			drm_do_get_edid(connector, dp_get_edid_block, dp);
-		struct cea_sad *sads;
-		int num_modes, num_sad;
+	edid = drm_do_get_edid(connector, dp_get_edid_block, dp);
+	if (!edid) {
+		dp_err(dp, "EDID: failed to read EDID from sink, using fake EDID\n");
+		edid = kmemdup(dp_fake_edid, EDID_LENGTH, GFP_KERNEL);
+	} else if (!drm_edid_is_valid(edid)) {
+		dp_err(dp, "EDID: invalid EDID, using fake EDID\n");
+		kfree(edid);
+		edid = kmemdup(dp_fake_edid, EDID_LENGTH, GFP_KERNEL);
+	}
 
-		if (edid) {
-			dp_parse_edid(dp, edid);
+	if (drm_connector_update_edid_property(connector, edid))
+		dp_err(dp, "EDID: drm_connector_update_edid_property() failed\n");
 
-			mutex_lock(&dev->mode_config.mutex);
-			dp_clean_drm_modes(dp);
-			num_modes = drm_add_edid_modes(connector, edid);
-			num_sad = drm_edid_to_sad(edid, &sads);
-			mutex_unlock(&dev->mode_config.mutex);
-			kfree(edid);
+	dp_parse_edid(dp, edid);
+	mutex_lock(&dev->mode_config.mutex);
+	dp_clean_drm_modes(dp);
+	dp->num_modes = drm_add_edid_modes(connector, edid);
+	fs_mode = drm_mode_duplicate(connector->dev, failsafe_mode);
+	if (fs_mode) {
+		drm_mode_probed_add(connector, fs_mode);
+		dp->num_modes++;
+	}
+	mutex_unlock(&dev->mode_config.mutex);
 
-			if (num_modes)
-				dp_find_prefer_mode(dp);
+	dp->num_sads = drm_edid_to_sad(edid, &sads);
+	dp_sad_to_audio_info(dp, sads);
+	if (dp->num_sads > 0)
+		kfree(sads);
+	kfree(edid);
 
-			if (num_sad > 0)
-				dp_sad_to_audio_info(dp, sads, num_sad);
-		}
+	dp->state = DP_STATE_ON;
+	dp_info(dp, "%s: DP State changed to ON\n", __func__);
 
-		dp->state = DP_STATE_ON;
-		dp_info(dp, "%s: DP State changed to ON\n", __func__);
-
-		/* Enable BIST video */
-		dp_enable(&dp->encoder);
-	} else {
-		dp->state = DP_STATE_ON;
-		dp_info(dp, "%s: DP State changed to ON\n", __func__);
-
+	if (dp->bist_mode == DP_BIST_OFF) {
 		hdcp_dplink_connect_state(DP_CONNECT);
 
 		if (dev) {
@@ -1134,8 +1257,16 @@ static void dp_on_by_hpd_plug(struct dp_device *dp)
 			drm_kms_helper_hotplug_event(dev);
 		}
 
-		dp_info(dp, "call DP audio notifier (connected)\n");
-		blocking_notifier_call_chain(&dp_ado_notifier_head, (unsigned long)1, NULL);
+		if (dp->sink.has_pcm_audio) {
+			dp_info(dp, "call DP audio notifier (connected)\n");
+			blocking_notifier_call_chain(&dp_ado_notifier_head, 1UL, NULL);
+		}
+	} else {
+		/* BIST mode */
+		drm_mode_copy(&dp->cur_mode, fs_mode);
+		dp_enable(&dp->encoder);
+		if (dp->bist_mode == DP_BIST_ON_HDCP)
+			hdcp_dplink_connect_state(DP_CONNECT);
 	}
 }
 
@@ -1193,7 +1324,7 @@ static void dp_off_by_hpd_plug(struct dp_device *dp)
 	int timeout = 0;
 
 	if (dp->state >= DP_STATE_ON) {
-		if (!dp->bist_used) {
+		if (dp->bist_mode == DP_BIST_OFF) {
 			hdcp_dplink_connect_state(DP_DISCONNECT);
 
 			if (dev) {
@@ -1204,8 +1335,10 @@ static void dp_off_by_hpd_plug(struct dp_device *dp)
 				drm_kms_helper_hotplug_event(dev);
 			}
 
-			dp_info(dp, "call DP audio notifier (disconnected)\n");
-			blocking_notifier_call_chain(&dp_ado_notifier_head, (unsigned long)-1, NULL);
+			if (dp->sink.has_pcm_audio) {
+				dp_info(dp, "call DP audio notifier (disconnected)\n");
+				blocking_notifier_call_chain(&dp_ado_notifier_head, -1UL, NULL);
+			}
 
 			/* Wait Audio is stopped if Audio is working. */
 			if (dp_get_audio_state(dp) != DP_AUDIO_DISABLE) {
@@ -1220,8 +1353,12 @@ static void dp_off_by_hpd_plug(struct dp_device *dp)
 				dp_err(dp, "dp_wait_state_change: timeout for disable\n");
 				dp_disable(&dp->encoder);
 			}
-		} else
-			dp_disable(&dp->encoder); /* for bist video disable */
+		} else {
+			/* BIST mode */
+			if (dp->bist_mode == DP_BIST_ON_HDCP)
+				hdcp_dplink_connect_state(DP_DISCONNECT);
+			dp_disable(&dp->encoder);
+		}
 	}
 }
 
@@ -1339,27 +1476,66 @@ static int dp_automated_test_irq_handler(struct dp_device *dp)
 	return 0;
 }
 
-static int dp_sink_specific_irq_handler(struct dp_device *dp)
+static void dp_update_link_status(struct dp_device *dp, enum link_training_status link_status)
 {
-	/*
-	 * When DP Sink catches some error situations, it can trigger Sink Specific IRQ.
-	 * DP Source will handle DP Link Re-negotiation while keeping DP connection.
-	 */
+	if (link_status != dp->typec_link_training_status) {
+		dp->typec_link_training_status = link_status;
+		sysfs_notify(&dp->dev->kobj, "drm-displayport", "link_status");
+	}
+}
+
+static int dp_link_down_event_handler(struct dp_device *dp)
+{
+	int ret;
 
 	/* Step_1. DP Off */
 	dp_off_by_hpd_plug(dp);
 
 	/* Step_2. DP Link Up again */
-	dp->typec_link_training_status = LINK_TRAINING_UNKNOWN;
-	if (dp_link_up(dp)) {
+	ret = dp_link_up(dp);
+	if (ret < 0) {
+		if (ret == -ENOLINK)
+			dp_update_link_status(dp, LINK_TRAINING_FAILURE);
+		else
+			dp_update_link_status(dp, LINK_TRAINING_FAILURE_SINK);
 		dp_err(dp, "failed to DP Link Up during re-negotiation\n");
-		dp->typec_link_training_status = LINK_TRAINING_FAILURE;
-		return -ENOLINK;
+		return ret;
 	}
-	dp->typec_link_training_status = LINK_TRAINING_SUCCESS;
 
 	/* Step_3. DP On */
+	dp_update_link_status(dp, LINK_TRAINING_SUCCESS);
 	dp_on_by_hpd_plug(dp);
+
+	return 0;
+}
+
+static int dp_downstream_port_event_handler(struct dp_device *dp, int new_sink_count)
+{
+	int ret;
+
+	if (dp->sink_count == 0 && new_sink_count > 0) {
+		/* establish DP link */
+		dp->sink_count = new_sink_count;
+		ret = dp_link_up(dp);
+		if (ret < 0) {
+			if (ret == -ENOLINK)
+				dp_update_link_status(dp, LINK_TRAINING_FAILURE);
+			else
+				dp_update_link_status(dp, LINK_TRAINING_FAILURE_SINK);
+			dp_err(dp, "failed to DP Link Up during DFP event\n");
+			return ret;
+		}
+
+		dp_update_link_status(dp, LINK_TRAINING_SUCCESS);
+		dp_on_by_hpd_plug(dp);
+	} else if (dp->sink_count > 0 && new_sink_count == 0) {
+		/* tear down DP link */
+		dp->sink_count = new_sink_count;
+		dp_off_by_hpd_plug(dp);
+		dp_link_down(dp);
+	} else {
+		dp->sink_count = new_sink_count;
+	}
 
 	return 0;
 }
@@ -1368,13 +1544,12 @@ static int dp_sink_specific_irq_handler(struct dp_device *dp)
 static void dp_work_hpd(struct work_struct *work)
 {
 	struct dp_device *dp = get_dp_drvdata();
+	enum link_training_status link_status = LINK_TRAINING_UNKNOWN;
+	int ret;
 
 	mutex_lock(&dp->hpd_lock);
 
 	if (dp_get_hpd_state(dp) == EXYNOS_HPD_PLUG) {
-		/* Reset before performing link training */
-		dp->typec_link_training_status = LINK_TRAINING_UNKNOWN;
-
 		pm_runtime_get_sync(dp->dev);
 		dp_debug(dp, "pm_rtm_get_sync usage_cnt(%d)\n",
 			 atomic_read(&dp->dev->power.usage_count));
@@ -1386,21 +1561,25 @@ static void dp_work_hpd(struct work_struct *work)
 		dp_hw_init(&dp->hw_config); /* for AUX ch read/write. */
 		usleep_range(10000, 11000);
 
-		if (dp_check_dp_sink(dp) < 0) {
-			dp_err(dp, "failed to check DP Sink status\n");
-			goto HPD_FAIL;
-		}
-
-		if (dp_link_up(dp)) {
+		ret = dp_link_up(dp);
+		if (ret < 0) {
+			if (ret == -ENOLINK)
+				link_status = LINK_TRAINING_FAILURE;
+			else
+				link_status = LINK_TRAINING_FAILURE_SINK;
 			dp_err(dp, "failed to DP Link Up\n");
 			goto HPD_FAIL;
 		}
-		dp->typec_link_training_status = LINK_TRAINING_SUCCESS;
 
-		dp_on_by_hpd_plug(dp);
+		if (dp->sink_count > 0) {
+			dp_update_link_status(dp, LINK_TRAINING_SUCCESS);
+			dp_on_by_hpd_plug(dp);
+		}
 	} else if (dp_get_hpd_state(dp) == EXYNOS_HPD_UNPLUG) {
-		dp_off_by_hpd_plug(dp);
-		dp_link_down(dp);
+		if (dp->sink_count > 0) {
+			dp_off_by_hpd_plug(dp);
+			dp_link_down(dp);
+		}
 
 		/* PHY power off */
 		dp_hw_deinit(&dp->hw_config);
@@ -1413,9 +1592,6 @@ static void dp_work_hpd(struct work_struct *work)
 
 		dp->state = DP_STATE_INIT;
 		dp_info(dp, "%s: DP State changed to INIT\n", __func__);
-
-		/* Mark unknown on cable disconnect as well */
-		dp->typec_link_training_status = LINK_TRAINING_UNKNOWN;
 	}
 
 	mutex_unlock(&dp->hpd_lock);
@@ -1439,7 +1615,14 @@ HPD_FAIL:
 	/* in error case, add delay to avoid very short interval reconnection */
 	msleep(300);
 
-	dp->typec_link_training_status = LINK_TRAINING_FAILURE;
+	// Use cached error so LINK_TRAINING_FAILURE doesn't retrigger hpd immediately.
+	dp_update_link_status(dp, link_status);
+
+	// TODO: We need to define more error codes, but for now use just 1 for generic error code
+	dp->dp_hotplug_error_code = 1;
+	dp_info(dp, "HPD_FAIL, call drm_kms_helper_hotplug_event(dp_hotplug_error_code=%d)\n",
+		dp->dp_hotplug_error_code);
+	drm_kms_helper_hotplug_event(dp->connector.dev);
 
 	mutex_unlock(&dp->hpd_lock);
 }
@@ -1449,16 +1632,79 @@ static u8 sysfs_triggered_irq = 0;
 static void dp_work_hpd_irq(struct work_struct *work)
 {
 	struct dp_device *dp = get_dp_drvdata();
-	u8 irq = 0;
+	u8 sink_count;
+	u8 irq = 0, irq2 = 0, irq3 = 0;
+	u8 link_status[DP_LINK_STATUS_SIZE];
 
 	if (sysfs_triggered_irq != 0) {
 		irq = sysfs_triggered_irq;
 		sysfs_triggered_irq = 0;
-	} else if (drm_dp_dpcd_readb(&dp->dp_aux, DP_DEVICE_SERVICE_IRQ_VECTOR, &irq) <= 0) {
-		dp_err(dp, "[HPD IRQ] cannot read DP_DEVICE_SERVICE_IRQ_VECTOR\n");
+		goto process_irq;
+	}
+
+	if (dp->sink.revision < DP_DPCD_REV_12) {
+		sink_count = drm_dp_read_sink_count(&dp->dp_aux);
+		dp_info(dp, "[HPD IRQ] sink count = %u\n", sink_count);
+
+		if (drm_dp_dpcd_readb(&dp->dp_aux, DP_DEVICE_SERVICE_IRQ_VECTOR, &irq) == 1)
+			dp_info(dp, "[HPD IRQ] device irq vector = %02x\n", irq);
+		else
+			dp_err(dp, "[HPD IRQ] cannot read DP_DEVICE_SERVICE_IRQ_VECTOR\n");
+
+		if (drm_dp_dpcd_read_link_status(&dp->dp_aux, link_status) == DP_LINK_STATUS_SIZE)
+			dp_info(dp, "[HPD IRQ] link status = %02x %02x %02x %02x\n",
+				link_status[0], link_status[1], link_status[2], link_status[3]);
+		else
+			dp_err(dp, "[HPD IRQ] cannot read link status\n");
+	} else {
+		if (drm_dp_dpcd_readb(&dp->dp_aux, DP_SINK_COUNT_ESI, &sink_count) == 1) {
+			sink_count = DP_GET_SINK_COUNT(sink_count);
+			dp_info(dp, "[HPD IRQ] sink count = %u\n", sink_count);
+		} else
+			dp_err(dp, "[HPD IRQ] cannot read DP_SINK_COUNT_ESI\n");
+
+		if (drm_dp_dpcd_readb(&dp->dp_aux, DP_DEVICE_SERVICE_IRQ_VECTOR_ESI0, &irq) == 1)
+			dp_info(dp, "[HPD IRQ] device irq vector esi0 = %02x\n", irq);
+		else
+			dp_err(dp, "[HPD IRQ] cannot read DP_DEVICE_SERVICE_IRQ_VECTOR_ESI0\n");
+
+		if (drm_dp_dpcd_readb(&dp->dp_aux, DP_DEVICE_SERVICE_IRQ_VECTOR_ESI1, &irq2) == 1)
+			dp_info(dp, "[HPD IRQ] device irq vector esi1 = %02x\n", irq2);
+		else
+			dp_err(dp, "[HPD IRQ] cannot read DP_DEVICE_SERVICE_IRQ_VECTOR_ESI1\n");
+
+		if (drm_dp_dpcd_readb(&dp->dp_aux, DP_LINK_SERVICE_IRQ_VECTOR_ESI0, &irq3) == 1)
+			dp_info(dp, "[HPD IRQ] link irq vector esi0 = %02x\n", irq3);
+		else
+			dp_err(dp, "[HPD IRQ] cannot read DP_LINK_SERVICE_IRQ_VECTOR_ESI0\n");
+
+		if (drm_dp_dpcd_read(&dp->dp_aux, DP_LANE0_1_STATUS_ESI, link_status,
+				     DP_LINK_STATUS_SIZE) == DP_LINK_STATUS_SIZE)
+			dp_info(dp, "[HPD IRQ] link status = %02x %02x %02x %02x\n",
+				link_status[0], link_status[1], link_status[2], link_status[3]);
+		else
+			dp_err(dp, "[HPD IRQ] cannot read link status\n");
+	}
+
+	if (dp->dfp_count > 0) {
+		if ((link_status[2] & DP_DOWNSTREAM_PORT_STATUS_CHANGED) ||
+		    (dp->sink_count != sink_count)) {
+			dp_info(dp, "[HPD IRQ] DP downstream port status change\n");
+			dp_downstream_port_event_handler(dp, sink_count);
+			return;
+		}
+
+		if (sink_count == 0)
+			return;
+	}
+
+	if (!drm_dp_channel_eq_ok(link_status, dp->link.num_lanes)) {
+		dp_info(dp, "[HPD IRQ] DP link is down, re-establish the link\n");
+		dp_link_down_event_handler(dp);
 		return;
 	}
 
+process_irq:
 	if (irq & DP_CP_IRQ) {
 		dp_info(dp, "[HPD IRQ] Content Protection\n");
 		hdcp_dplink_handle_irq();
@@ -1467,7 +1713,7 @@ static void dp_work_hpd_irq(struct work_struct *work)
 		dp_automated_test_irq_handler(dp);
 	} else if (irq & DP_SINK_SPECIFIC_IRQ) {
 		dp_info(dp, "[HPD IRQ] Sink Specific\n");
-		dp_sink_specific_irq_handler(dp);
+		dp_link_down_event_handler(dp);
 	} else
 		dp_info(dp, "[HPD IRQ] unknown IRQ (0x%X)\n", irq);
 }
@@ -1526,6 +1772,9 @@ static int usb_typec_dp_notification_locked(struct dp_device *dp, enum hotplug_s
 
 		if (dp_get_hpd_state(dp) == EXYNOS_HPD_PLUG)
 			dp_hpd_changed(dp, EXYNOS_HPD_UNPLUG);
+
+		/* Mark unknown on HPD UNPLUG */
+		dp_update_link_status(dp, LINK_TRAINING_UNKNOWN);
 	}
 
 	return NOTIFY_OK;
@@ -1601,7 +1850,16 @@ int dp_dpcd_read_for_hdcp22(u32 address, u32 length, u8 *data)
 	struct dp_device *dp = get_dp_drvdata();
 	int ret;
 
-	ret = drm_dp_dpcd_read(&dp->dp_aux, address, data, length);
+	mutex_lock(&dp->hpd_lock);
+	pm_runtime_get_sync(dp->dev);
+	if (dp_get_hpd_state(dp) == EXYNOS_HPD_PLUG) {
+		ret = drm_dp_dpcd_read(&dp->dp_aux, address, data, length);
+	} else {
+		ret = -EFAULT;
+	}
+	pm_runtime_put_sync(dp->dev);
+	mutex_unlock(&dp->hpd_lock);
+
 	if (ret == length)
 		return 0;
 
@@ -1615,7 +1873,16 @@ int dp_dpcd_write_for_hdcp22(u32 address, u32 length, u8 *data)
 	struct dp_device *dp = get_dp_drvdata();
 	int ret;
 
-	ret = drm_dp_dpcd_write(&dp->dp_aux, address, data, length);
+	mutex_lock(&dp->hpd_lock);
+	pm_runtime_get_sync(dp->dev);
+	if (dp_get_hpd_state(dp) == EXYNOS_HPD_PLUG) {
+		ret = drm_dp_dpcd_write(&dp->dp_aux, address, data, length);
+	} else {
+		ret = -EFAULT;
+	}
+	pm_runtime_put_sync(dp->dev);
+	mutex_unlock(&dp->hpd_lock);
+
 	if (ret == length)
 		return 0;
 
@@ -1666,13 +1933,153 @@ static const struct drm_encoder_funcs dp_encoder_funcs = {
 	.destroy = drm_encoder_cleanup,
 };
 
+static void dp_connector_reset(struct drm_connector *connector)
+{
+	/* Need to preserve max BPC settings over reset */
+	u8 max_bpc = connector->state->max_bpc;
+	u8 max_req_bpc = connector->state->max_requested_bpc;
+
+	drm_atomic_helper_connector_reset(connector);
+
+	connector->state->max_bpc = max_bpc;
+	connector->state->max_requested_bpc = max_req_bpc;
+}
+
 /* DP DRM Connector Functions */
+static ssize_t dp_crc_enabled_write(struct file *file, const char __user *buffer, size_t len,
+				    loff_t *ppos)
+{
+	struct seq_file *s = file->private_data;
+	struct dp_device *dp = s->private;
+	int res;
+	int enable = 0;
+
+	res = kstrtoint_from_user(buffer, len, 0, &enable);
+	if (res) {
+		dp_warn(dp, "%s: invalid value %s\n", __func__, buffer);
+		return len;
+	}
+
+	res = dp_crc_set_enabled(SST1, enable);
+	if (res == 0) {
+		mutex_lock(&dp->cmd_lock);
+		dp->dp_link_crc_enabled = enable ? true : false;
+		mutex_unlock(&dp->cmd_lock);
+		dp_debug(dp, "%s: dp_crc_set_enabled(SST1, %d) successfully\n", __func__, enable);
+	} else
+		dp_warn(dp, "%s: dp_crc_set_enabled(SST1, %d) failed res=%d\n", __func__, enable,
+			res);
+
+	return len;
+}
+
+static int dp_crc_enabled_show(struct seq_file *s, void *unused)
+{
+	struct dp_device *dp = s->private;
+
+	mutex_lock(&dp->cmd_lock);
+	seq_printf(s, "%d\n", dp->dp_link_crc_enabled);
+	mutex_unlock(&dp->cmd_lock);
+	return 0;
+}
+
+static int dp_crc_enabled_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, dp_crc_enabled_show, inode->i_private);
+}
+
+static const struct file_operations dp_crc_enabled_fops = {
+	.owner = THIS_MODULE,
+	.open = dp_crc_enabled_open,
+	.read = seq_read,
+	.write = dp_crc_enabled_write,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
+static int dp_crc_values_show(struct seq_file *s, void *unused)
+{
+	struct dp_device *dp = s->private;
+	bool crc_enabled = false;
+	int res = 0;
+	u32 crc_data[3];
+
+	mutex_lock(&dp->cmd_lock);
+	crc_enabled = dp->dp_link_crc_enabled;
+	mutex_unlock(&dp->cmd_lock);
+	if (!crc_enabled) {
+		seq_puts(s, "CRCs are disabled\n");
+		return 0;
+	}
+
+	res = dp_crc_get(SST1, crc_data);
+	if (res != 0) {
+		seq_printf(s, "dp_crc_get failed, res=%d\n", res);
+		dp_warn(dp, "%s: dp_crc_get failed, res=%d\n", __func__, res);
+		return 0;
+	}
+
+	dp_debug(dp, "%s: Got CRCs R:%04X G:%04X B:%04X\n", __func__, crc_data[0], crc_data[1],
+		 crc_data[2]);
+	seq_printf(s, "R:%04X G:%04X B:%04X\n", crc_data[0], crc_data[1], crc_data[2]);
+	return 0;
+}
+
+static int dp_crc_values_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, dp_crc_values_show, inode->i_private);
+}
+
+static ssize_t dp_crc_values_write(struct file *file, const char __user *buffer, size_t len,
+				   loff_t *ppos)
+{
+	struct seq_file *s = file->private_data;
+	struct dp_device *dp = s->private;
+	int res = 0;
+
+	res = dp_crc_reset(SST1);
+	if (res)
+		dp_warn(dp, "%s: dp_crc_reset failed, res=%d\n", __func__, res);
+	else
+		dp_debug(dp, "%s: dp_crc_reset finished successfully\n", __func__);
+
+	return len;
+}
+
+static const struct file_operations dp_crc_values_fops = {
+	.owner = THIS_MODULE,
+	.open = dp_crc_values_open,
+	.read = seq_read,
+	.write = dp_crc_values_write,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
+static int drm_dp_late_register(struct drm_connector *connector)
+{
+	struct dentry *root = connector->debugfs_entry;
+
+	dp_drvdata->dp_crc_enabled_debugfs_file =
+		debugfs_create_file("dp_crc_enabled", 0644, root, dp_drvdata, &dp_crc_enabled_fops);
+	dp_drvdata->dp_crc_values_debugfs_file =
+		debugfs_create_file("dp_crc_values", 0644, root, dp_drvdata, &dp_crc_values_fops);
+	return 0;
+}
+
+static void drm_dp_early_unregister(struct drm_connector *connector)
+{
+	debugfs_remove(dp_drvdata->dp_crc_enabled_debugfs_file);
+	debugfs_remove(dp_drvdata->dp_crc_values_debugfs_file);
+}
+
 static const struct drm_connector_funcs dp_connector_funcs = {
-	.reset = drm_atomic_helper_connector_reset,
+	.reset = dp_connector_reset,
 	.fill_modes = drm_helper_probe_single_connector_modes,
 	.destroy = drm_connector_cleanup,
 	.atomic_duplicate_state = drm_atomic_helper_connector_duplicate_state,
 	.atomic_destroy_state = drm_atomic_helper_connector_destroy_state,
+	.late_register = drm_dp_late_register,
+	.early_unregister = drm_dp_early_unregister,
 };
 
 /* DP DRM Connector Helper Functions */
@@ -1689,33 +2096,28 @@ static int dp_detect(struct drm_connector *connector,
 static int dp_get_modes(struct drm_connector *connector)
 {
 	struct dp_device *dp = connector_to_dp(connector);
-	struct edid *edid;
-	int num_modes;
 
 	if (dp->state == DP_STATE_INIT) {
 		dp_warn(dp, "%s: DP is not ON\n", __func__);
 		return 0;
 	}
 
-	edid = drm_do_get_edid(connector, dp_get_edid_block, dp);
-	if (!edid) {
-		dp_err(dp, "failed to read EDID\n");
-		return 0;
-	}
-
-	dp_clean_drm_modes(dp);
-	drm_connector_update_edid_property(connector, edid);
-	num_modes = drm_add_edid_modes(connector, edid);
-	if (num_modes)
-		dp_find_prefer_mode(dp);
-	kfree(edid);
-
-	return num_modes;
+	dp_info(dp, "dp->num_modes = %d\n", dp->num_modes);
+	return dp->num_modes;
 }
 
 static enum drm_mode_status dp_conn_mode_valid(struct drm_connector *connector, struct drm_display_mode *mode)
 {
 	struct dp_device *dp = connector_to_dp(connector);
+	struct drm_display_info *display_info = &connector->display_info;
+
+	/*
+	 * drm_atomic_connector_check() hasn't been called yet.
+	 * We can't use connector->state->max_bpc directly.
+	 * Need to do the same math here.
+	 */
+	u8 dbpc = display_info->bpc ? display_info->bpc : 8;
+	u8 bpc = min(dbpc, connector->state->max_requested_bpc);
 
 	/*
 	 * DP link max data rate in Kbps
@@ -1726,8 +2128,8 @@ static enum drm_mode_status dp_conn_mode_valid(struct drm_connector *connector, 
 	 */
 	u32 link_data_rate = dp->link.link_rate * dp->link.num_lanes * 8;
 
-	/* DRM display mode data rate (@ 8 bpc) in Kbps */
-	u32 mode_data_rate = mode->clock * 24;
+	/* DRM display mode data rate in Kbps */
+	u32 mode_data_rate = mode->clock * 3 * bpc;
 
 	if (link_data_rate < mode_data_rate) {
 		dp_info(dp, "DROP: " DRM_MODE_FMT "\n", DRM_MODE_ARG(mode));
@@ -1810,6 +2212,10 @@ static int dp_bind(struct device *dev, struct device *master, void *data)
 	}
 
 	dp_fill_host_caps(dp);
+
+	drm_atomic_helper_connector_reset(&dp->connector);
+	drm_connector_attach_max_bpc_property(&dp->connector, 6, dp->host.max_bpc);
+
 	dp_info(dp, "DP Driver has been binded\n");
 
 	return ret;
@@ -1873,6 +2279,12 @@ static int dp_remap_regs(struct dp_device *dp, struct platform_device *pdev)
 	int i, ret = 0;
 
 	/* DP Link SFR */
+	i = of_property_match_string(np, "reg-names", "link");
+	if (of_address_to_resource(np, i, &res)) {
+		dp_err(dp, "failed to get DP Link resource\n");
+		goto err;
+	}
+
 	dp->res.link_regs = devm_platform_ioremap_resource_byname(pdev, "link");
 	if (IS_ERR(dp->res.link_regs)) {
 		dp_err(dp, "failed to remap DP LINK SFR region\n");
@@ -2047,6 +2459,30 @@ static ssize_t hpd_show(struct device *dev, struct device_attribute *attr, char 
 }
 static DEVICE_ATTR_RW(hpd);
 
+static ssize_t dp_hotplug_error_code_show(struct device *dev, struct device_attribute *attr,
+					  char *buf)
+{
+	struct dp_device *dp = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%d\n", dp->dp_hotplug_error_code);
+}
+
+static ssize_t dp_hotplug_error_code_store(struct device *dev, struct device_attribute *attr,
+					   const char *buf, size_t size)
+{
+	struct dp_device *dp = get_dp_drvdata();
+	int new_value = 0;
+
+	if (kstrtoint(buf, 0, &new_value) < 0) {
+		dp_warn(dp, "%s: parse error, buf=%s\n", __func__, buf);
+		return -EINVAL;
+	}
+	dp->dp_hotplug_error_code = new_value;
+	return size;
+}
+
+static DEVICE_ATTR_RW(dp_hotplug_error_code);
+
 static ssize_t link_status_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	struct dp_device *dp = dev_get_drvdata(dev);
@@ -2067,98 +2503,13 @@ static ssize_t irq_hpd_store(struct device *dev, struct device_attribute *attr, 
 }
 static DEVICE_ATTR_WO(irq_hpd);
 
-static const char *const link_rate_opts[] = {
-	[DP_LINK_RATE_RBR] = "RBR",
-	[DP_LINK_RATE_HBR] = "HBR",
-	[DP_LINK_RATE_HBR2] = "HBR2",
-	[DP_LINK_RATE_HBR3] = "HBR3",
-};
-
-static ssize_t link_rate_store(struct device *dev, struct device_attribute *attr,
-				const char *buf, size_t size)
-{
-	struct dp_device *dp = dev_get_drvdata(dev);
-	int link_rate = sysfs_match_string(link_rate_opts, buf);
-
-	if (link_rate < 0)
-		return -EINVAL;
-
-	dp_rate = link_rate;
-	dp_fill_host_caps(dp);
-
-	return size;
-}
-
-static ssize_t link_rate_show(struct device *dev, struct device_attribute *attr,
-				char *buf)
-{
-	return sysfs_emit(buf, "%s\n", link_rate_opts[dp_rate]);
-}
-static DEVICE_ATTR_RW(link_rate);
-
-static ssize_t link_lanes_store(struct device *dev, struct device_attribute *attr,
-				const char *buf, size_t size)
-{
-	struct dp_device *dp = dev_get_drvdata(dev);
-	unsigned long link_lanes;
-
-	if (kstrtoul(buf, 10, &link_lanes) != 0)
-		return -EINVAL;
-
-	if (link_lanes != 1 && link_lanes != 2 && link_lanes != 4)
-		return -EINVAL;
-
-	dp_lanes = link_lanes;
-	dp_fill_host_caps(dp);
-
-	return size;
-}
-
-static ssize_t link_lanes_show(struct device *dev, struct device_attribute *attr,
-				char *buf)
-{
-	return sysfs_emit(buf, "%lu\n", dp_lanes);
-}
-static DEVICE_ATTR_RW(link_lanes);
-
-static ssize_t trigger_automated_test_irq_store(struct device *dev, struct device_attribute *attr,
-						const char *buf, size_t size)
-{
-	struct dp_device *dp = dev_get_drvdata(dev);
-
-	mutex_lock(&dp->typec_notification_lock);
-	sysfs_triggered_irq = DP_AUTOMATED_TEST_REQUEST;
-	usb_typec_dp_notification_locked(dp, EXYNOS_HPD_IRQ);
-	mutex_unlock(&dp->typec_notification_lock);
-	return size;
-}
-static DEVICE_ATTR_WO(trigger_automated_test_irq);
-
-static ssize_t trigger_sink_specific_irq_store(struct device *dev, struct device_attribute *attr,
-					       const char *buf, size_t size)
-{
-	struct dp_device *dp = dev_get_drvdata(dev);
-
-	mutex_lock(&dp->typec_notification_lock);
-	sysfs_triggered_irq = DP_SINK_SPECIFIC_IRQ;
-	usb_typec_dp_notification_locked(dp, EXYNOS_HPD_IRQ);
-	mutex_unlock(&dp->typec_notification_lock);
-	return size;
-}
-static DEVICE_ATTR_WO(trigger_sink_specific_irq);
-
-static struct attribute *dp_attrs[] = {
-	&dev_attr_orientation.attr,
-	&dev_attr_pin_assignment.attr,
-	&dev_attr_hpd.attr,
-	&dev_attr_link_status.attr,
-	&dev_attr_irq_hpd.attr,
-	&dev_attr_link_rate.attr,
-	&dev_attr_link_lanes.attr,
-	&dev_attr_trigger_automated_test_irq.attr,
-	&dev_attr_trigger_sink_specific_irq.attr,
-	NULL
-};
+static struct attribute *dp_attrs[] = { &dev_attr_orientation.attr,
+					&dev_attr_pin_assignment.attr,
+					&dev_attr_hpd.attr,
+					&dev_attr_dp_hotplug_error_code.attr,
+					&dev_attr_link_status.attr,
+					&dev_attr_irq_hpd.attr,
+					NULL };
 
 static const struct attribute_group dp_group = {
 	.name = "drm-displayport",

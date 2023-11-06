@@ -122,6 +122,7 @@ MODULE_DEVICE_TABLE(of, dsim_of_match);
 
 static int dsim_calc_underrun(const struct dsim_device *dsim, uint32_t hs_clock_mhz,
 		uint32_t *underrun);
+static int dsim_set_hs_clock(struct dsim_device *dsim, unsigned int hs_clock, bool apply_now);
 
 inline void dsim_trace_msleep(u32 delay_ms)
 {
@@ -523,6 +524,7 @@ static void dsim_encoder_disable(struct drm_encoder *encoder, struct drm_atomic_
 	struct drm_crtc *crtc = drm_encoder_get_old_crtc(encoder, state);
 	bool self_refresh_active = false;
 	bool was_in_self_refresh = false;
+	u32 pending_hs_clk;
 
 	if (crtc) {
 		const struct drm_crtc_state *old_crtc_state =
@@ -540,6 +542,16 @@ static void dsim_encoder_disable(struct drm_encoder *encoder, struct drm_atomic_
 		   was_in_self_refresh, self_refresh_active);
 
 	DPU_ATRACE_BEGIN(__func__);
+
+	mutex_lock(&dsim->state_lock);
+	pending_hs_clk = dsim->clk_param.pending_hs_clk;
+	mutex_unlock(&dsim->state_lock);
+	if (pending_hs_clk) {
+		if (dsim_set_hs_clock(dsim, pending_hs_clk, false) < 0)
+			dsim_warn(dsim, "failed to set pending_hs_clk=%u\n", pending_hs_clk);
+		else
+			dsim_info(dsim, "set pending_hs_clk=%u\n", pending_hs_clk);
+	}
 
 	if (self_refresh_active) {
 		const struct exynos_drm_crtc_state *exynos_crtc_state =
@@ -618,6 +630,11 @@ dsim_get_clock_mode(const struct dsim_device *dsim,
 static void dsim_update_clock_config(struct dsim_device *dsim,
 				     const struct dsim_pll_param *p)
 {
+	/*
+	 * TODO(b/298878831): DPU trace shouldn't be added here since decon may be
+	 * null while running this function. Need to find another way to trace the
+	 * change of hs_clk, or add the protection to avoid possible race condition.
+	 */
 	dsim->config.dphy_pms.p = p->p;
 	dsim->config.dphy_pms.m = p->m;
 	dsim->config.dphy_pms.s = p->s;
@@ -635,8 +652,18 @@ static void dsim_update_clock_config(struct dsim_device *dsim,
 	dsim->config.dphy_pms.rsel = p->rsel;
 	dsim->config.dphy_pms.dither_en = p->dither_en;
 
+	dsim_debug(dsim, "clk_param.hs_clk=%u, pll_freq=%u, pending_hs_clk=%u\n",
+		dsim->clk_param.hs_clk, p->pll_freq, dsim->clk_param.pending_hs_clk);
+	if (dsim->clk_param.hs_clk != p->pll_freq) {
+		dsim->clk_param.hs_clk_changed = true;
+		dsim->clk_param.pending_hs_clk = 0;
+	} else if (dsim->clk_param.pending_hs_clk) {
+		dsim->clk_param.hs_clk_changed = true;
+	}
 	dsim->clk_param.hs_clk = p->pll_freq;
 	dsim->clk_param.esc_clk = p->esc_freq;
+	if (dsim->clk_param.hs_clk_changed)
+		dsim_info(dsim, "hs_clk is changed to %u\n", p->pll_freq);
 
 	dsim_debug(dsim, "found proper pll parameter\n");
 	dsim_debug(dsim, "\t%s(p:0x%x,m:0x%x,s:0x%x,k:0x%x)\n", p->name,
@@ -2477,7 +2504,7 @@ static int dsim_set_hs_clock(struct dsim_device *dsim, unsigned int hs_clock, bo
 	memset(&pms, 0, sizeof(pms));
 	ret = dsim_calc_pmsk(dsim->pll_params->features, &pms, hs_clock);
 	if (ret < 0) {
-		dsim_err(dsim, "Failed to update pll for hsclk %d\n", hs_clock);
+		dsim_err(dsim, "Failed to update pll for hsclk %u\n", hs_clock);
 		return -EINVAL;
 	}
 
@@ -2491,6 +2518,11 @@ static int dsim_set_hs_clock(struct dsim_device *dsim, unsigned int hs_clock, bo
 	pll_param = dsim->current_pll_param;
 	if (!pll_param) {
 		ret = -EAGAIN;
+		goto out;
+	}
+
+	if (hs_clock == pll_param->pll_freq) {
+		dsim_debug(dsim, "the same hs_clock=%u\n", hs_clock);
 		goto out;
 	}
 
@@ -2577,6 +2609,7 @@ static ssize_t hs_clock_store(struct device *dev,
 			      const char *buf, size_t len)
 {
 	struct dsim_device *dsim = dev_get_drvdata(dev);
+	struct dsim_pll_param *pll_param;
 	int rc;
 	unsigned int hs_clock;
 	bool apply_now = true;
@@ -2586,6 +2619,14 @@ static ssize_t hs_clock_store(struct device *dev,
 	char *apply_now_str;
 	char *p = params;
 
+	mutex_lock(&dsim->state_lock);
+	pll_param = dsim->current_pll_param;
+	if (unlikely(!pll_param)) {
+		dsim_warn(dsim, "%s: unable to get pll param\n", __func__);
+		rc = -EAGAIN;
+		goto out;
+	}
+
 	strlcpy(params, buf, sizeof(params));
 	hs_clk_str = strsep(&p, " ");
 	apply_now_str = strsep(&p, " ");
@@ -2593,20 +2634,45 @@ static ssize_t hs_clock_store(struct device *dev,
 	if (apply_now_str) {
 		rc = kstrtobool(apply_now_str, &apply_now);
 		if (rc < 0)
-		    return rc;
+			goto out;
 	}
 
 	rc = kstrtouint(hs_clk_str, 0, &hs_clock);
 	if (rc < 0)
-		return rc;
+		goto out;
 
 	/* ddr hs_clock unit: MHz */
 	dsim_info(dsim, "%s: hs clock %u, apply now: %u\n", __func__, hs_clock, apply_now);
+
+	if (dsim->state != DSIM_STATE_HSCLKEN) {
+		if (pll_param->pll_freq == hs_clock) {
+			dsim_debug(dsim, "set the same hs_clock=%u while idle\n", hs_clock);
+			dsim->clk_param.pending_hs_clk = 0;
+		} else {
+			dsim_info(dsim, "not in HS state, set pending_hs_clk=%u\n", hs_clock);
+			dsim->clk_param.pending_hs_clk = hs_clock;
+		}
+		rc = len;
+		goto out;
+	} else {
+		dsim->clk_param.pending_hs_clk = 0;
+		if (pll_param->pll_freq == hs_clock) {
+			dsim_debug(dsim, "set the same hs_clock=%u while active\n", hs_clock);
+			rc = len;
+			goto out;
+		}
+	}
+	mutex_unlock(&dsim->state_lock);
+
 	rc = dsim_set_hs_clock(dsim, hs_clock, apply_now);
 	if (rc < 0)
 		return rc;
 
 	return len;
+
+out:
+	mutex_unlock(&dsim->state_lock);
+	return rc;
 }
 static DEVICE_ATTR_RW(hs_clock);
 

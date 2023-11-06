@@ -38,10 +38,6 @@
 #define FIXED_TE2_VREFRESH_NORMAL	120
 #define FIXED_TE2_VREFRESH_LP		30
 
-#define HDR_DOLBY_VISION	BIT(1)
-#define HDR_HDR10		BIT(2)
-#define HDR_HLG			BIT(3)
-
 #define BL_STATE_STANDBY	BL_CORE_FBBLANK
 #define BL_STATE_LP		BIT(30) /* backlight is in LP mode */
 
@@ -487,12 +483,34 @@ struct exynos_panel_funcs {
 				    const struct exynos_panel_mode *pmode);
 
 	/**
+	 * @rr_need_te_high
+	 *
+	 * check if a panel needs send rr cmds at TE high window.
+	 */
+	bool (*rr_need_te_high)(struct exynos_panel *exynos_panel,
+				    const struct exynos_panel_mode *pmode);
+
+	/**
 	 * @run_normal_mode_work
 	 *
 	 * This callback is used to run the periodic work for each panel in
 	 * normal mode.
 	 */
 	void (*run_normal_mode_work)(struct exynos_panel *exynos_panel);
+
+	/**
+	 * @update_ffc
+	 *
+	 * This callback is used to update FFC (Frame Frequency Control) for panel.
+	 */
+	void (*update_ffc)(struct exynos_panel *exynos_panel, unsigned int hs_clk);
+
+	/**
+	 * @pre_update_ffc
+	 *
+	 * This callback is used to do something before updating FFC for panel.
+	 */
+	void (*pre_update_ffc)(struct exynos_panel *exynos_panel);
 };
 
 /**
@@ -588,6 +606,8 @@ struct exynos_panel_desc {
 	 *    - if `freq set` is changed when lhbm is on, lhbm may not work normally.
 	 */
 	bool no_lhbm_rr_constraints;
+	/* schedule sysfs_notify in workq */
+	bool use_async_notify;
 	const u32 lhbm_post_cmd_delay_frames;
 	const u32 lhbm_effective_delay_frames;
 	/**
@@ -616,6 +636,7 @@ struct exynos_panel_desc {
 	const struct panel_reg_ctrl reg_ctrl_pre_disable[PANEL_REG_COUNT];
 	const struct panel_reg_ctrl reg_ctrl_disable[PANEL_REG_COUNT];
 	const u32 normal_mode_work_delay_ms;
+	const u32 default_dsi_hs_clk;
 };
 
 #define PANEL_ID_MAX		40
@@ -700,6 +721,10 @@ struct exynos_panel {
 	bool self_refresh_active;
 	/* indicates if panel brightness is set or not after reset */
 	bool is_brightness_initialized;
+	/* indicates need to adjust vddd lp in self refresh */
+	bool need_post_vddd_lp;
+	/* adjust lp vddd in self refresh instead of mode set */
+	bool post_vddd_lp;
 	/**
 	 * refresh rate in panel idle mode
 	 * 0 means not in idle mode or not specified
@@ -757,6 +782,10 @@ struct exynos_panel {
 	ktime_t last_panel_idle_set_ts;
 	struct delayed_work idle_work;
 
+	/* works of sysfs_notify */
+	struct work_struct state_notify;
+	struct work_struct brightness_notify;
+
 	/**
 	 * Record the last refresh rate switch. Note the mode switch doesn't
 	 * mean rr switch so it differs from last_mode_set_ts
@@ -811,6 +840,8 @@ struct exynos_panel {
 	enum mode_progress_type mode_in_progress;
 	/* indicates BTS raise due to op_hz switch */
 	bool boosted_for_op_hz;
+	/* current MIPI DSI HS clock (frequency) */
+	u32 dsi_hs_clk;
 };
 
 /**
