@@ -15,6 +15,7 @@
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
+#include <drm/drm_bridge.h>
 #include <drm/drm_crtc.h>
 #include <drm/drm_crtc_helper.h>
 #include <drm/drm_fb_helper.h>
@@ -25,6 +26,7 @@
 #include <uapi/linux/videodev2_exynos_media.h>
 #include <linux/dma-buf.h>
 #include <linux/pm_runtime.h>
+#include <linux/of_reserved_mem.h>
 
 #include <trace/dpu_trace.h>
 
@@ -227,7 +229,8 @@ void *exynos_drm_fb_to_vaddr(const struct drm_framebuffer *fb)
 }
 
 static void plane_state_to_win_config(struct dpu_bts_win_config *win_config,
-				      const struct drm_plane_state *plane_state)
+				      const struct drm_plane_state *plane_state,
+				      const u32 dpp_id)
 {
 	const struct drm_framebuffer *fb = plane_state->fb;
 	unsigned int simplified_rot;
@@ -255,7 +258,8 @@ static void plane_state_to_win_config(struct dpu_bts_win_config *win_config,
 		win_config->state = DPU_WIN_STATE_BUFFER;
 
 	win_config->format = fb->format->format;
-	win_config->dpp_ch = plane_state->plane->index;
+	win_config->dpp_id = dpp_id;
+	win_config->zpos = plane_state->normalized_zpos;
 
 	win_config->comp_src = 0;
 	if (has_all_bits(DRM_FORMAT_MOD_ARM_AFBC(0), fb->modifier))
@@ -276,9 +280,9 @@ static void plane_state_to_win_config(struct dpu_bts_win_config *win_config,
 			win_config->src_w, win_config->src_h,
 			win_config->dst_x, win_config->dst_y,
 			win_config->dst_w, win_config->dst_h);
-	DRM_DEBUG("rot[%d] afbc[%d] format[%d] ch[%d] zpos[%d] comp_src[%llu]\n",
+	DRM_DEBUG("rot[%d] afbc[%d] format[%d] ch[%u] zpos[%u] comp_src[%llu]\n",
 			win_config->is_rot, win_config->is_comp,
-			win_config->format, win_config->dpp_ch,
+			win_config->format, win_config->dpp_id,
 			plane_state->normalized_zpos,
 			win_config->comp_src);
 	DRM_DEBUG("alpha[%d] blend mode[%d]\n",
@@ -304,19 +308,19 @@ static void conn_state_to_win_config(struct dpu_bts_win_config *win_config,
 	win_config->is_comp = false;
 	win_config->state = DPU_WIN_STATE_BUFFER;
 	win_config->format = fb->format->format;
-	win_config->dpp_ch = wb->id;
+	win_config->dpp_id = wb->id;
 	win_config->comp_src = 0;
 	win_config->is_rot = false;
 	win_config->is_secure = (fb->modifier & DRM_FORMAT_MOD_PROTECTION) != 0;
 
-	DRM_DEBUG("src[%d %d %d %d], dst[%d %d %d %d]\n",
+	DRM_DEBUG("src[%u %u %u %u], dst[%d %d %u %u]\n",
 			win_config->src_x, win_config->src_y,
 			win_config->src_w, win_config->src_h,
 			win_config->dst_x, win_config->dst_y,
 			win_config->dst_w, win_config->dst_h);
-	DRM_DEBUG("rot[%d] afbc[%d] format[%d] ch[%d] comp_src[%llu]\n",
+	DRM_DEBUG("rot[%d] afbc[%d] format[%u] ch[%u] comp_src[%llu]\n",
 			win_config->is_rot, win_config->is_comp,
-			win_config->format, win_config->dpp_ch,
+			win_config->format, win_config->dpp_id,
 			win_config->comp_src);
 }
 
@@ -345,7 +349,7 @@ static void exynos_atomic_bts_pre_update(struct drm_device *dev,
 			if (new_plane_state->crtc) {
 				decon = crtc_to_decon(new_plane_state->crtc);
 				win_config = &decon->bts.rcd_win_config.win;
-				plane_state_to_win_config(win_config, new_plane_state);
+				plane_state_to_win_config(win_config, new_plane_state, dpp->id);
 
 				decon->bts.rcd_win_config.dma_addr =
 					exynos_drm_fb_dma_addr(new_plane_state->fb, 0);
@@ -358,7 +362,7 @@ static void exynos_atomic_bts_pre_update(struct drm_device *dev,
 			decon = crtc_to_decon(new_plane_state->crtc);
 			win_config = &decon->bts.win_config[zpos];
 
-			plane_state_to_win_config(win_config, new_plane_state);
+			plane_state_to_win_config(win_config, new_plane_state, dpp->id);
 
 			decon->dpp[i]->dbg_dma_addr =
 				exynos_drm_fb_dma_addr(new_plane_state->fb, 0);
@@ -438,7 +442,7 @@ static void exynos_atomic_bts_post_update(struct drm_device *dev,
 	for_each_new_crtc_in_state(old_state, crtc, new_crtc_state, i) {
 		decon = crtc_to_decon(crtc);
 
-		if (new_crtc_state->planes_changed && new_crtc_state->active) {
+		if (new_crtc_state->active) {
 
 			/*
 			 * keeping a copy of comp src in dpp after it has been
@@ -466,20 +470,137 @@ static void exynos_atomic_bts_post_update(struct drm_device *dev,
 	}
 }
 
-static void exynos_atomic_commit_tail(struct drm_atomic_state *old_state)
+/*
+ * rmem_device_init is called in of_reserved_mem_device_init_by_idx function
+ * when reserved memory is required.
+ */
+static int rmem_device_init(struct reserved_mem *rmem, struct device *dev)
 {
-	int i;
-	struct drm_device *dev = old_state->dev;
+	struct decon_device *decon = dev_get_drvdata(dev);
+
+	decon->fb_handover.phys_addr = rmem->base;
+	decon->fb_handover.phys_size = rmem->size;
+	pr_debug("%s base(%pa) size(%pa)\n", __func__, &decon->fb_handover.phys_addr,
+			&decon->fb_handover.phys_size);
+
+	return 0;
+}
+
+/*
+ * rmem_device_release is called in of_reserved_mem_device_release function
+ * when reserved memory is no longer required.
+ */
+static void rmem_device_release(struct reserved_mem *rmem, struct device *dev)
+{
+	struct page *first = phys_to_page(PAGE_ALIGN(rmem->base));
+	struct page *last = phys_to_page((rmem->base + rmem->size) & PAGE_MASK);
+	struct page *page;
+
+	for (page = first; page != last; page++) {
+		__ClearPageReserved(page);
+		set_page_count(page, 1);
+		__free_pages(page, 0);
+		adjust_managed_page_count(page, 1);
+	}
+}
+
+static const struct reserved_mem_ops rmem_ops = {
+	.device_init    = rmem_device_init,
+	.device_release = rmem_device_release,
+};
+
+void exynos_rmem_register(struct decon_device *decon)
+{
+	struct device_node *np, *rmem_np;
+	struct reserved_mem *rmem;
+	struct device *dev = decon->dev;
+
+	np = dev->of_node;
+
+	rmem_np = of_parse_phandle(np, "memory-region", 0);
+	if (!rmem_np) {
+		pr_debug("failed to get reserve memory phandle\n");
+		return;
+	}
+
+	rmem = of_reserved_mem_lookup(rmem_np);
+	if (!rmem) {
+		pr_err("failed to reserve memory lookup\n");
+		return;
+	}
+
+	of_node_put(rmem_np);
+	rmem->ops = &rmem_ops;
+	decon->fb_handover.rmem = rmem;
+	of_reserved_mem_device_init_by_idx(dev, np, 0);
+}
+
+static void exynos_rmem_free(struct decon_device *decon)
+{
+	of_reserved_mem_device_release(decon->dev);
+
+	decon->fb_handover.rmem = NULL;
+	decon->fb_handover.phys_size = 0;
+}
+
+static void
+exynos_disable_outputs(struct drm_device *dev, struct drm_atomic_state *old_state,
+			unsigned int *disabling_crtc_mask)
+{
 	struct decon_device *decon;
+	struct drm_connector *connector;
+	struct drm_connector_state *old_conn_state, *new_conn_state;
 	struct drm_crtc *crtc;
 	struct drm_crtc_state *old_crtc_state, *new_crtc_state;
-	struct drm_connector *connector;
-	struct drm_connector_state *old_conn_state;
-	struct drm_connector_state *new_conn_state;
-	unsigned int hibernation_crtc_mask = 0;
-	unsigned int disabling_crtc_mask = 0;
+	int i;
 
-	DPU_ATRACE_BEGIN("exynos_atomic_commit_tail");
+	for_each_oldnew_connector_in_state(old_state, connector, old_conn_state,
+			new_conn_state, i) {
+		struct drm_encoder *encoder;
+		struct drm_bridge *bridge;
+
+		/* Shut down everything that's in the changeset and currently
+		 * still on. So need to check the old, saved state.
+		 */
+		if (!old_conn_state->crtc)
+			continue;
+
+		old_crtc_state = drm_atomic_get_old_crtc_state(old_state, old_conn_state->crtc);
+
+		if (new_conn_state->crtc)
+			new_crtc_state = drm_atomic_get_new_crtc_state(
+						old_state,
+						new_conn_state->crtc);
+		else
+			new_crtc_state = NULL;
+
+		/*  TODO(b/237120310): needs cleanup after we identify mode_changed handling */
+		if (old_crtc_state->self_refresh_active && new_crtc_state &&
+			new_crtc_state->mode_changed)
+			old_crtc_state->active = true;
+
+		if (!exynos_crtc_needs_disable(old_crtc_state, new_crtc_state) ||
+			!drm_atomic_crtc_needs_modeset(old_conn_state->crtc->state))
+			continue;
+
+		encoder = old_conn_state->best_encoder;
+
+		/* We shouldn't get this far if we didn't previously have
+		 * an encoder.. but WARN_ON() rather than explode.
+		 */
+		if (WARN_ON(!encoder))
+			continue;
+
+		DRM_DEBUG_ATOMIC("disabling bridge chain [ENCODER:%u:%s]\n",
+				encoder->base.id, encoder->name);
+
+		/*
+		 * Each encoder has at most one connector (since we always steal
+		 * it away), so we won't call disable hooks twice.
+		 */
+		bridge = drm_bridge_chain_get_first_bridge(encoder);
+		drm_atomic_bridge_chain_disable(bridge, old_state);
+	}
 
 	for_each_oldnew_crtc_in_state(old_state, crtc, old_crtc_state,
 			new_crtc_state, i) {
@@ -506,16 +627,10 @@ static void exynos_atomic_commit_tail(struct drm_atomic_state *old_state)
 		DPU_EVENT_LOG(DPU_EVT_REQ_CRTC_INFO_NEW, decon->id,
 				new_crtc_state);
 
-		if (new_crtc_state->active || old_crtc_state->active) {
-			hibernation_block(decon->hibernation);
-
-			hibernation_crtc_mask |= drm_crtc_mask(crtc);
-		}
-
 		if (drm_atomic_crtc_effectively_active(old_crtc_state) && !new_crtc_state->active) {
 			/* keep runtime vote while disabling is taking place */
 			pm_runtime_get_sync(decon->dev);
-			disabling_crtc_mask |= drm_crtc_mask(crtc);
+			*disabling_crtc_mask |= drm_crtc_mask(crtc);
 		}
 
 		if (old_crtc_state->active && drm_atomic_crtc_needs_modeset(new_crtc_state)) {
@@ -533,13 +648,109 @@ static void exynos_atomic_commit_tail(struct drm_atomic_state *old_state)
 
 			DPU_ATRACE_END("crtc_disable");
 		}
-		/*  TODO(b/237120310): needs cleanup after we identify mode_changed handling */
-		if (old_crtc_state->self_refresh_active && new_crtc_state->mode_changed)
-			old_crtc_state->active = true;
 	}
 
+	for_each_oldnew_connector_in_state(old_state, connector, old_conn_state,
+			new_conn_state, i) {
+		const struct drm_encoder_helper_funcs *funcs;
+		struct drm_encoder *encoder;
+		struct drm_bridge *bridge;
+
+		/* Shut down everything that's in the changeset and currently
+		 * still on. So need to check the old, saved state.
+		 */
+		if (!old_conn_state->crtc)
+			continue;
+
+		old_crtc_state = drm_atomic_get_old_crtc_state(old_state, old_conn_state->crtc);
+
+		if (new_conn_state->crtc)
+			new_crtc_state = drm_atomic_get_new_crtc_state(
+						old_state,
+						new_conn_state->crtc);
+		else
+			new_crtc_state = NULL;
+
+		if (!exynos_crtc_needs_disable(old_crtc_state, new_crtc_state) ||
+			!drm_atomic_crtc_needs_modeset(old_conn_state->crtc->state))
+			continue;
+
+		encoder = old_conn_state->best_encoder;
+
+		/* We shouldn't get this far if we didn't previously have
+		 * an encoder.. but WARN_ON() rather than explode.
+		 */
+		if (WARN_ON(!encoder))
+			continue;
+
+		funcs = encoder->helper_private;
+
+		DRM_DEBUG_ATOMIC("disabling [ENCODER:%u:%s]\n",
+				encoder->base.id, encoder->name);
+
+		/*
+		 * Each encoder has at most one connector (since we always steal
+		 * it away), so we won't call disable hooks twice.
+		 */
+		bridge = drm_bridge_chain_get_first_bridge(encoder);
+
+		/* Right function depends upon target state. */
+		if (funcs) {
+			if (funcs->atomic_disable)
+				funcs->atomic_disable(encoder, old_state);
+			else if (new_conn_state->crtc && funcs->prepare)
+				funcs->prepare(encoder);
+			else if (funcs->disable)
+				funcs->disable(encoder);
+			else if (funcs->dpms)
+				funcs->dpms(encoder, DRM_MODE_DPMS_OFF);
+		}
+
+		drm_atomic_bridge_chain_post_disable(bridge, old_state);
+	}
+}
+
+/**
+ * exynos_drm_atomic_helper_commit_modeset_disables - modeset commit to disable outputs
+ * @dev: DRM device
+ * @old_state: atomic state object with old state structures
+ * @disabling_crtc_mask: the disabling crtc mask
+ *
+ * This function shuts down all the outputs that need to be shut down and
+ * prepares them (if required) with the new mode.
+ *
+ * For compatibility with legacy CRTC helpers this should be called before
+ * drm_atomic_helper_commit_planes(), which is what the default commit function
+ * does. But drivers with different needs can group the modeset commits together
+ * and do the plane commits at the end. This is useful for drivers doing runtime
+ * PM since planes updates then only happen when the CRTC is actually enabled.
+ */
+static void exynos_drm_atomic_helper_commit_modeset_disables(struct drm_device *dev,
+			struct drm_atomic_state *old_state, unsigned int *disabling_crtc_mask)
+{
+	exynos_disable_outputs(dev, old_state, disabling_crtc_mask);
+
+	drm_atomic_helper_update_legacy_modeset_state(dev, old_state);
+	drm_atomic_helper_calc_timestamping_constants(old_state);
+
+	exynos_crtc_set_mode(dev, old_state);
+}
+
+static void exynos_atomic_commit_tail(struct drm_atomic_state *old_state)
+{
+	int i;
+	struct drm_device *dev = old_state->dev;
+	struct decon_device *decon;
+	struct drm_crtc *crtc;
+	struct drm_crtc_state *new_crtc_state;
+	struct drm_connector *connector;
+	struct drm_connector_state *old_conn_state;
+	struct drm_connector_state *new_conn_state;
+	unsigned int disabling_crtc_mask = 0;
+
+	DPU_ATRACE_BEGIN("exynos_atomic_commit_tail");
 	DPU_ATRACE_BEGIN("modeset");
-	drm_atomic_helper_commit_modeset_disables(dev, old_state);
+	exynos_drm_atomic_helper_commit_modeset_disables(dev, old_state, &disabling_crtc_mask);
 
 	exynos_atomic_bts_pre_update(dev, old_state);
 
@@ -619,10 +830,15 @@ static void exynos_atomic_commit_tail(struct drm_atomic_state *old_state)
 
 	for_each_new_crtc_in_state(old_state, crtc, new_crtc_state, i) {
 		decon = crtc_to_decon(crtc);
-		if (hibernation_crtc_mask & drm_crtc_mask(crtc))
-			hibernation_unblock_enter(decon->hibernation);
 		if (disabling_crtc_mask & drm_crtc_mask(crtc))
 			pm_runtime_put_sync(decon->dev);
+		if (decon->fb_handover.rmem) {
+			struct exynos_drm_crtc_state *exynos_crtc_state =
+				to_exynos_crtc_state(new_crtc_state);
+
+			if (!exynos_crtc_state->skip_update)
+				exynos_rmem_free(decon);
+		}
 	}
 
 	drm_atomic_helper_commit_hw_done(old_state);

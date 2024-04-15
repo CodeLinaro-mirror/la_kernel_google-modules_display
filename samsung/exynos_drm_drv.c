@@ -420,6 +420,8 @@ static int exynos_atomic_helper_wait_for_fences(struct drm_device *dev,
 			pr_err("%s: timeout of waiting for fence, name:%s idx:%d\n",
 				__func__, plane->name ? : "NA", plane->index);
 			if (crtc) {
+				const struct decon_device *decon = crtc_to_decon(crtc);
+				const struct decon_config *cfg = &decon->config;
 				struct exynos_drm_crtc_state *new_exynos_crtc_state;
 				struct drm_crtc_state *new_crtc_state;
 
@@ -428,7 +430,8 @@ static int exynos_atomic_helper_wait_for_fences(struct drm_device *dev,
 					!new_crtc_state->enable || !new_crtc_state->active)
 					continue;
 				new_exynos_crtc_state = to_exynos_crtc_state(new_crtc_state);
-				if (!new_exynos_crtc_state->skip_update) {
+				if (!new_exynos_crtc_state->skip_update &&
+					   cfg->mode.op_mode != DECON_VIDEO_MODE) {
 					new_exynos_crtc_state->skip_update = true;
 					pr_warn("%s: skip frame update at %s\n",
 									__func__, crtc->name);
@@ -467,10 +470,25 @@ static int exynos_atomic_helper_wait_for_fences(struct drm_device *dev,
 
 static void commit_tail(struct drm_atomic_state *old_state)
 {
-	struct drm_device *dev = old_state->dev;
+	int i;
 	const struct drm_mode_config_helper_funcs *funcs;
+	struct decon_device *decon;
+	struct drm_crtc *crtc;
+	struct drm_crtc_state *old_crtc_state, *new_crtc_state;
+	struct drm_device *dev = old_state->dev;
+	unsigned int hibernation_crtc_mask = 0;
 
 	funcs = dev->mode_config.helper_private;
+
+	for_each_oldnew_crtc_in_state(old_state, crtc, old_crtc_state,
+			new_crtc_state, i) {
+		decon = crtc_to_decon(crtc);
+		if (new_crtc_state->active || old_crtc_state->active) {
+			hibernation_block(decon->hibernation);
+
+			hibernation_crtc_mask |= drm_crtc_mask(crtc);
+		}
+	}
 
 	DPU_ATRACE_BEGIN("wait_for_fences");
 	exynos_atomic_helper_wait_for_fences(dev, old_state, false);
@@ -483,6 +501,12 @@ static void commit_tail(struct drm_atomic_state *old_state)
 	else
 		drm_atomic_helper_commit_tail(old_state);
 
+	for_each_new_crtc_in_state(old_state, crtc, new_crtc_state, i) {
+		decon = crtc_to_decon(crtc);
+		if (hibernation_crtc_mask & drm_crtc_mask(crtc))
+			hibernation_unblock_enter(decon->hibernation);
+	}
+
 	drm_atomic_helper_commit_cleanup_done(old_state);
 
 	drm_atomic_state_put(old_state);
@@ -490,10 +514,11 @@ static void commit_tail(struct drm_atomic_state *old_state)
 
 static void commit_kthread_work(struct kthread_work *work)
 {
-	struct exynos_drm_priv_state *exynos_priv_state =
-		container_of(work, struct exynos_drm_priv_state, commit_work);
-	struct drm_atomic_state *old_state = exynos_priv_state->old_state;
+	struct exynos_drm_crtc_state *old_exynos_crtc_state =
+		container_of(work, struct exynos_drm_crtc_state, commit_work);
+	struct drm_atomic_state *old_state = old_exynos_crtc_state->base.state;
 
+	BUG_ON(!old_state);
 	commit_tail(old_state);
 }
 
@@ -505,8 +530,7 @@ static void commit_work(struct work_struct *work)
 	commit_tail(old_state);
 }
 
-static void exynos_atomic_queue_work(struct drm_atomic_state *old_state, bool nonblock,
-				     struct kthread_work *work)
+static void exynos_atomic_queue_work(struct drm_atomic_state *old_state)
 {
 	struct drm_crtc *crtc;
 	struct drm_crtc_state *old_crtc_state;
@@ -519,10 +543,10 @@ static void exynos_atomic_queue_work(struct drm_atomic_state *old_state, bool no
 	 * TODO: can work be split per display?
 	 */
 	for_each_old_crtc_in_state(old_state, crtc, old_crtc_state, i) {
-		struct exynos_drm_crtc *exynos_crtc =
-			container_of(crtc, struct exynos_drm_crtc, base);
-		struct decon_device *decon = exynos_crtc->ctx;
+		struct decon_device *decon = crtc_to_decon(crtc);
+		struct kthread_work *work = &to_exynos_crtc_state(old_crtc_state)->commit_work;
 
+		kthread_init_work(work, commit_kthread_work);
 		kthread_queue_work(&decon->worker, work);
 
 		return;
@@ -535,7 +559,6 @@ static void exynos_atomic_queue_work(struct drm_atomic_state *old_state, bool no
 
 int exynos_atomic_commit(struct drm_device *dev, struct drm_atomic_state *state, bool nonblock)
 {
-	struct exynos_drm_priv_state *exynos_priv_state;
 	struct drm_crtc *crtc;
 	struct drm_crtc_state *old_crtc_state;
 	int i, ret;
@@ -564,15 +587,6 @@ int exynos_atomic_commit(struct drm_device *dev, struct drm_atomic_state *state,
 	ret = drm_atomic_helper_setup_commit(state, !stall);
 	if (ret)
 		goto err;
-
-	exynos_priv_state = exynos_drm_get_priv_state(state);
-	if (IS_ERR(exynos_priv_state)) {
-		ret = PTR_ERR(exynos_priv_state);
-		goto err;
-	}
-
-	kthread_init_work(&exynos_priv_state->commit_work, commit_kthread_work);
-	exynos_priv_state->old_state = state;
 
 	ret = drm_atomic_helper_prepare_planes(dev, state);
 	if (ret)
@@ -614,7 +628,7 @@ int exynos_atomic_commit(struct drm_device *dev, struct drm_atomic_state *state,
 	if (!nonblock)
 		commit_tail(state);
 	else
-		exynos_atomic_queue_work(state, nonblock, &exynos_priv_state->commit_work);
+		exynos_atomic_queue_work(state);
 
 err:
 	DPU_ATRACE_END("exynos_atomic_commit");
@@ -644,10 +658,9 @@ int exynos_atomic_enter_tui(void)
 	struct drm_plane *plane;
 	struct drm_crtc_state *crtc_state;
 	struct drm_crtc *crtc;
-	struct drm_connector *conn;
-	struct drm_connector_state *conn_state;
 	u32 tui_crtc_mask = 0;
 	struct exynos_drm_private *private = drm_to_exynos_dev(dev);
+	struct exynos_drm_connector_state *exynos_conn_state;
 
 	pr_debug("%s +\n", __func__);
 
@@ -676,8 +689,6 @@ int exynos_atomic_enter_tui(void)
 	state->acquire_ctx = &ctx;
 
 	drm_for_each_crtc(crtc, dev) {
-		struct exynos_drm_crtc_state *exynos_crtc_state;
-
 		crtc_state = drm_atomic_get_crtc_state(state, crtc);
 		if (IS_ERR(crtc_state)) {
 			ret = PTR_ERR(crtc_state);
@@ -687,14 +698,10 @@ int exynos_atomic_enter_tui(void)
 		if (!crtc_state->enable || !crtc_state->active)
 			continue;
 
-		exynos_crtc_state = to_exynos_crtc_state(crtc_state);
+		decon = crtc_to_decon(crtc);
+		/* get an extra ref count while in TUI, to keep power domain active */
+		pm_runtime_get_sync(decon->dev);
 
-		exynos_crtc_state->bypass = true;
-		/*
-		 * set crtc in self refresh, this will keep power/regulators
-		 * enabled but disable everything else
-		 */
-		crtc_state->self_refresh_active = true;
 		crtc_state->active = false;
 		tui_crtc_mask |= drm_crtc_mask(crtc);
 
@@ -705,26 +712,25 @@ int exynos_atomic_enter_tui(void)
 		ret = drm_atomic_add_affected_connectors(state, crtc);
 		if (ret)
 			goto err;
+
+		exynos_conn_state = crtc_get_exynos_connector_state(state, crtc_state);
+		if (exynos_conn_state) {
+			exynos_conn_state->blanked_mode = true;
+
+			if (exynos_conn_state->base.self_refresh_aware) {
+				struct exynos_drm_crtc_state *exynos_crtc_state =
+					to_exynos_crtc_state(crtc_state);
+
+				exynos_crtc_state->bypass = true;
+				crtc_state->self_refresh_active = true;
+			}
+		}
 	}
 
 	if (!tui_crtc_mask) {
 		pr_err("%s:unable to enter tui without any active crtcs\n", __func__);
 		ret = -EINVAL;
 		goto err;
-	}
-
-	for_each_new_connector_in_state(state, conn, conn_state, i) {
-		if (!conn_state->self_refresh_aware &&
-		    (conn->connector_type != DRM_MODE_CONNECTOR_WRITEBACK)) {
-			pr_warn("%s: %s doesn't support self refresh\n", __func__, conn->name);
-			goto err;
-		}
-		if (is_exynos_drm_connector(conn)) {
-			struct exynos_drm_connector_state *exynos_conn_state =
-				to_exynos_connector_state(conn_state);
-
-			exynos_conn_state->blanked_mode = true;
-		}
 	}
 
 	for_each_new_plane_in_state(state, plane, plane_state, i) {
@@ -757,6 +763,10 @@ err_dup:
 	drm_for_each_crtc(crtc, dev) {
 		decon = crtc_to_decon(crtc);
 		hibernation_unblock_enter(decon->hibernation);
+
+		/* remove pm refs on failure */
+		if (ret && (tui_crtc_mask & drm_crtc_mask(crtc)))
+			pm_runtime_put_sync(decon->dev);
 	}
 
 	return ret;
@@ -771,6 +781,9 @@ int exynos_atomic_exit_tui(void)
 	struct drm_mode_config *mode_config = &dev->mode_config;
 	struct drm_modeset_acquire_ctx ctx;
 	struct exynos_drm_private *private = drm_to_exynos_dev(dev);
+	struct drm_crtc *crtc;
+	struct drm_crtc_state *crtc_state;
+	int i;
 
 	pr_debug("%s +\n", __func__);
 
@@ -796,6 +809,14 @@ int exynos_atomic_exit_tui(void)
 		pr_err("%s: failed to atomic commit suspend_state(0x%x)\n", __func__, ret);
 	else
 		mode_config->suspend_state = NULL;
+
+	for_each_new_crtc_in_state(state, crtc, crtc_state, i) {
+		if (crtc_state->active) {
+			decon = crtc_to_decon(crtc);
+			/* drop the ref taken during enter tui */
+			pm_runtime_put_sync(decon->dev);
+		}
+	}
 
 	DRM_MODESET_LOCK_ALL_END(dev, ctx, ret);
 	if (!ret)

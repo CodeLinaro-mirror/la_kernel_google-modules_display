@@ -13,15 +13,17 @@
 #include <linux/kernel.h>
 #include <linux/console.h>
 #include <linux/debugfs.h>
-#include <linux/ktime.h>
 #include <linux/moduleparam.h>
 #include <linux/pm_runtime.h>
+#include <linux/sched/clock.h>
+#include <linux/sysfs.h>
 #include <linux/time.h>
 #include <video/mipi_display.h>
 #include <drm/drm_print.h>
 #include <drm/drm_managed.h>
 #include <drm/drm_fourcc.h>
 #include <drm/drm_fourcc_gs101.h>
+#include <trace/dpu_trace.h>
 
 #include <cal_config.h>
 
@@ -48,7 +50,7 @@ static unsigned int dpu_event_print_underrun = 128;
 static unsigned int dpu_event_print_fail_update_bw = 32;
 static unsigned int dpu_debug_dump_mask = DPU_EVT_CONDITION_DEFAULT |
 	DPU_EVT_CONDITION_UNDERRUN | DPU_EVT_CONDITION_FAIL_UPDATE_BW |
-	DPU_EVT_CONDITION_FIFO_TIMEOUT;
+	DPU_EVT_CONDITION_FIFO_TIMEOUT | DPU_EVT_CONDITION_IDMA_ERROR_COMPACT;
 
 module_param_named(event_log_max, dpu_event_log_max, uint, 0);
 module_param_named(event_print_max, dpu_event_print_max, uint, 0600);
@@ -88,6 +90,31 @@ static void dpu_event_save_freqs(struct dpu_log_freqs *freqs)
 static void dpu_event_save_freqs(struct dpu_log_freqs *freqs) { }
 #endif
 
+static struct dpu_log *dpu_event_get_next(struct decon_device *decon)
+{
+	struct dpu_log *log;
+	unsigned long flags;
+	int idx;
+
+	if (!decon) {
+		pr_err("%s: invalid decon\n", __func__);
+		return NULL;
+	}
+
+	if (IS_ERR_OR_NULL(decon->d.event_log))
+		return NULL;
+
+	spin_lock_irqsave(&decon->d.event_lock, flags);
+	idx = atomic_inc_return(&decon->d.event_log_idx) % dpu_event_log_max;
+	log = &decon->d.event_log[idx];
+	log->type = DPU_EVT_NONE;
+	spin_unlock_irqrestore(&decon->d.event_lock, flags);
+
+	log->ts_nsec = local_clock();
+
+	return log;
+}
+
 /* ===== EXTERN APIs ===== */
 
 /*
@@ -103,17 +130,16 @@ void DPU_EVENT_LOG(enum dpu_event_type type, int index, void *priv)
 {
 	struct decon_device *decon = NULL;
 	struct dpp_device *dpp = NULL;
+	struct dsim_device *dsim = NULL;
 	struct dpu_log *log;
 	struct drm_crtc_state *crtc_state;
 	struct drm_plane_state *plane_state;
 	const struct drm_format_info *fb_format;
 	struct exynos_partial *partial;
 	struct drm_rect *partial_region;
-	unsigned long flags;
-	int idx;
 	bool skip_excessive = true;
 
-	if (index < 0) {
+	if (index < 0 || index >= MAX_DECON_CNT) {
 		DRM_ERROR("%s: decon id is not valid(%d)\n", __func__, index);
 		return;
 	}
@@ -149,6 +175,7 @@ void DPU_EVENT_LOG(enum dpu_event_type type, int index, void *priv)
 	case DPU_EVT_IDMA_DEADLOCK:
 	case DPU_EVT_IDMA_CFG_ERROR:
 		decon->d.idma_err_cnt++;
+		DPU_ATRACE_INT_PID("IDMA_ERROR", decon->d.idma_err_cnt & 1, decon->thread->pid);
 		break;
 	default:
 		skip_excessive = false;
@@ -162,19 +189,21 @@ void DPU_EVENT_LOG(enum dpu_event_type type, int index, void *priv)
 	if (skip_excessive && dpu_event_ignore(type, decon))
 		return;
 
-	spin_lock_irqsave(&decon->d.event_lock, flags);
-	idx = atomic_inc_return(&decon->d.event_log_idx) % dpu_event_log_max;
-	log = &decon->d.event_log[idx];
-	log->type = DPU_EVT_NONE;
-	spin_unlock_irqrestore(&decon->d.event_lock, flags);
-
-	log->time = ktime_get();
+	log = dpu_event_get_next(decon);
+	if (!log)
+		return;
 
 	switch (type) {
 	case DPU_EVT_DPP_FRAMEDONE:
 		dpp = (struct dpp_device *)priv;
 		log->data.dpp.id = dpp->id;
 		log->data.dpp.win_id = dpp->win_id;
+		break;
+	case DPU_EVT_DPP_SET_PROTECTION:
+		dpp = (struct dpp_device *)priv;
+		log->data.dpp.id = dpp->id;
+		log->data.dpp.mst_security = dpp->rdma_mst_security;
+		log->data.dpp.last_secure_pid = current->pid;
 		break;
 	case DPU_EVT_DMA_RECOVERY:
 		dpp = (struct dpp_device *)priv;
@@ -201,12 +230,32 @@ void DPU_EVENT_LOG(enum dpu_event_type type, int index, void *priv)
 		break;
 	case DPU_EVT_DECON_RUNTIME_SUSPEND:
 	case DPU_EVT_DECON_RUNTIME_RESUME:
+	case DPU_EVT_DECON_SUSPEND:
+	case DPU_EVT_DECON_RESUME:
 	case DPU_EVT_ENTER_HIBERNATION_IN:
 	case DPU_EVT_ENTER_HIBERNATION_OUT:
 	case DPU_EVT_EXIT_HIBERNATION_IN:
 	case DPU_EVT_EXIT_HIBERNATION_OUT:
 		log->data.pd.decon_state = decon->state;
 		log->data.pd.rpm_active = pm_runtime_active(decon->dev);
+		break;
+	case DPU_EVT_DECON_UPDATE_CONFIG:
+		log->data.decon_cfg.fps = decon->bts.fps;
+		log->data.decon_cfg.image_height = decon->config.image_height;
+		log->data.decon_cfg.image_width = decon->config.image_width;
+		log->data.decon_cfg.out_type = decon->config.out_type;
+		log->data.decon_cfg.mode.op_mode = decon->config.mode.op_mode;
+		log->data.decon_cfg.mode.dsi_mode = decon->config.mode.dsi_mode;
+		log->data.decon_cfg.mode.trig_mode = decon->config.mode.trig_mode;
+		break;
+	case DPU_EVT_DSIM_RUNTIME_SUSPEND:
+	case DPU_EVT_DSIM_RUNTIME_RESUME:
+	case DPU_EVT_DSIM_SUSPEND:
+	case DPU_EVT_DSIM_RESUME:
+		dsim = (struct dsim_device *)priv;
+		log->data.pd.rpm_active = pm_runtime_active(decon->dev);
+		log->data.pd.dsim_state = dsim->state;
+		log->data.pd.dsim_rpm_active = pm_runtime_active(dsim->dev);
 		break;
 	case DPU_EVT_PLANE_PREPARE_FB:
 	case DPU_EVT_PLANE_CLEANUP_FB:
@@ -216,7 +265,7 @@ void DPU_EVENT_LOG(enum dpu_event_type type, int index, void *priv)
 				exynos_drm_fb_dma_addr(plane_state->fb, 0);
 		log->data.plane_info.width = plane_state->fb->width;
 		log->data.plane_info.height = plane_state->fb->height;
-		log->data.plane_info.zpos = plane_state->zpos;
+		log->data.plane_info.zpos = plane_state->normalized_zpos;
 		log->data.plane_info.format = fb_format->format;
 		log->data.plane_info.index = plane_state->plane->index;
 		break;
@@ -225,6 +274,7 @@ void DPU_EVENT_LOG(enum dpu_event_type type, int index, void *priv)
 		dpp = (struct dpp_device *)priv;
 		log->data.win.win_idx = dpp->win_id;
 		log->data.win.plane_idx = dpp->id;
+		log->data.win.secure = dpp->protection;
 		break;
 	case DPU_EVT_REQ_CRTC_INFO_OLD:
 	case DPU_EVT_REQ_CRTC_INFO_NEW:
@@ -235,6 +285,7 @@ void DPU_EVENT_LOG(enum dpu_event_type type, int index, void *priv)
 		log->data.crtc_info.planes_changed = crtc_state->planes_changed;
 		log->data.crtc_info.mode_changed = crtc_state->mode_changed;
 		log->data.crtc_info.active_changed = crtc_state->active_changed;
+		log->data.crtc_info.connectors_changed = crtc_state->connectors_changed;
 		break;
 	case DPU_EVT_BTS_RELEASE_BW:
 	case DPU_EVT_BTS_UPDATE_BW:
@@ -254,6 +305,8 @@ void DPU_EVENT_LOG(enum dpu_event_type type, int index, void *priv)
 		log->data.bts_cal.read_bw = decon->bts.read_bw;
 		log->data.bts_cal.write_bw = decon->bts.write_bw;
 		log->data.bts_cal.fps = decon->bts.fps;
+		crtc_state = (struct drm_crtc_state *)priv;
+		log->data.bts_cal.crtc_fps = drm_mode_vrefresh(&crtc_state->mode);
 		break;
 	case DPU_EVT_DSIM_UNDERRUN:
 		dpu_event_save_freqs(&log->data.bts_event.freqs);
@@ -300,8 +353,7 @@ void DPU_EVENT_LOG_ATOMIC_COMMIT(int index)
 {
 	struct decon_device *decon;
 	struct dpu_log *log;
-	unsigned long flags;
-	int idx, i, dpp_ch;
+	int i, dpp_id;
 
 	if (index < 0) {
 		DRM_ERROR("%s: decon id is not valid(%d)\n", __func__, index);
@@ -309,17 +361,9 @@ void DPU_EVENT_LOG_ATOMIC_COMMIT(int index)
 	}
 
 	decon = get_decon_drvdata(index);
-
-	if (IS_ERR_OR_NULL(decon->d.event_log))
+	log = dpu_event_get_next(decon);
+	if (!log)
 		return;
-
-	spin_lock_irqsave(&decon->d.event_lock, flags);
-	idx = atomic_inc_return(&decon->d.event_log_idx) % dpu_event_log_max;
-	log = &decon->d.event_log[idx];
-	log->type = DPU_EVT_NONE;
-	spin_unlock_irqrestore(&decon->d.event_lock, flags);
-
-	log->time = ktime_get();
 
 	decon->d.auto_refresh_frames = 0;
 
@@ -329,10 +373,10 @@ void DPU_EVENT_LOG_ATOMIC_COMMIT(int index)
 				sizeof(struct dpu_bts_win_config));
 
 		if (decon->bts.win_config[i].state == DPU_WIN_STATE_BUFFER) {
-			dpp_ch = decon->bts.win_config[i].dpp_ch;
+			dpp_id = decon->bts.win_config[i].dpp_id;
 
 			log->data.atomic.win_config[i].dma_addr =
-				decon->dpp[dpp_ch]->dbg_dma_addr;
+				decon->dpp[DPPCH2PLANE(dpp_id)]->dbg_dma_addr;
 		}
 	}
 
@@ -343,31 +387,6 @@ void DPU_EVENT_LOG_ATOMIC_COMMIT(int index)
 }
 
 extern void *return_address(unsigned int);
-
-static struct dpu_log *dpu_event_get_next(struct decon_device *decon)
-{
-	struct dpu_log *log;
-	unsigned long flags;
-	int idx;
-
-	if (!decon) {
-		pr_err("%s: invalid decon\n", __func__);
-		return NULL;
-	}
-
-	if (IS_ERR_OR_NULL(decon->d.event_log))
-		return NULL;
-
-	spin_lock_irqsave(&decon->d.event_lock, flags);
-	idx = atomic_inc_return(&decon->d.event_log_idx) % dpu_event_log_max;
-	log = &decon->d.event_log[idx];
-	log->type = DPU_EVT_NONE;
-	spin_unlock_irqrestore(&decon->d.event_lock, flags);
-
-	log->time = ktime_get();
-
-	return log;
-}
 
 /*
  * DPU_EVENT_LOG_CMD() - store DSIM command information
@@ -401,7 +420,7 @@ DPU_EVENT_LOG_CMD(struct dsim_device *dsim, u8 type, u8 d0, u16 len)
 	log->type = DPU_EVT_DSIM_COMMAND;
 }
 
-static void dpu_print_log_win_config(const struct decon_win_config *const win_config, int index,
+static void dpu_print_log_win_config(const struct decon_win_config *const win_config,
 				     bool is_rcd, struct drm_printer *p)
 {
 	static const char *const str_state[3] = { "DISABLED", "COLOR", "BUFFER" };
@@ -409,17 +428,17 @@ static void dpu_print_log_win_config(const struct decon_win_config *const win_co
 	const struct dpu_fmt *const fmt = dpu_find_fmt_info(win->format);
 
 	char buf[128];
-	int len = scnprintf(buf, sizeof(buf), "\t\t\t\t\t%s%d: %s[0x%llx] SRC[%d %d %d %d] %s%s%s",
-			    is_rcd ? "RCD" : "WIN", index, str_state[win->state],
-			    (win->state == DPU_WIN_STATE_BUFFER) ? win_config->dma_addr : 0,
-			    win->src_x, win->src_y, win->src_w, win->src_h,
-			    (win->is_comp) ? "AFBC " : "", (win->is_rot) ? "ROT " : "",
-			    (win->is_secure) ? "SECURE " : "");
+	int len = scnprintf(buf, sizeof(buf),
+			"\t\t\t\t\t%s: %s[0x%llx] CH%d SRC[%d %d %d %d] %s%s%s",
+			is_rcd ? "RCD" : "WIN", str_state[win->state],
+			(win->state == DPU_WIN_STATE_BUFFER) ? win_config->dma_addr : 0,
+			(win->state == DPU_WIN_STATE_COLOR) ? -1 : win->dpp_id,
+			win->src_x, win->src_y, win->src_w, win->src_h,
+			(win->is_comp) ? "AFBC " : "", (win->is_rot) ? "ROT " : "",
+			(win->is_secure) ? "SECURE " : "");
 	len += scnprintf(buf + len, sizeof(buf) - len, "DST[%d %d %d %d] ", win->dst_x, win->dst_y,
 			 win->dst_w, win->dst_h);
-	if (win->state == DPU_WIN_STATE_BUFFER)
-		len += scnprintf(buf + len, sizeof(buf) - len, "CH%d", win->dpp_ch);
-
+	len += scnprintf(buf + len, sizeof(buf) - len, "ZPOS%d", win->zpos);
 	drm_printf(p, "%s %s %s\n", buf, dpu_get_fmt_name(fmt), get_comp_src_name(win->comp_src));
 }
 
@@ -440,16 +459,16 @@ static void dpu_print_log_atomic(struct dpu_log_atomic *atomic,
 			pr_warn("%s: invalid win state %d\n", __func__, win->state);
 			continue;
 		}
-		dpu_print_log_win_config(&atomic->win_config[i], i, false, p);
+		dpu_print_log_win_config(&atomic->win_config[i], false, p);
 	}
 
 	win = &atomic->rcd_win_config.win;
 	if (win->state == DPU_WIN_STATE_BUFFER) {
-		dpu_print_log_win_config(&atomic->rcd_win_config, 0, true, p);
+		dpu_print_log_win_config(&atomic->rcd_win_config, true, p);
 	}
 }
 
-static void dpu_print_log_rsc(char *buf, int len, struct dpu_log_rsc_occupancy *rsc)
+static void dpu_print_log_rsc(char *buf, int len, u32 decon_id, struct dpu_log_rsc_occupancy *rsc)
 {
 	int i, len_chs, len_wins;
 	char str_chs[128];
@@ -460,11 +479,11 @@ static void dpu_print_log_rsc(char *buf, int len, struct dpu_log_rsc_occupancy *
 	len_wins = sprintf(str_wins, "WINs: ");
 
 	for (i = 0; i < MAX_PLANE; ++i) {
-		using_ch = is_decon_using_ch(0, rsc->rsc_ch, i);
+		using_ch = is_decon_using_ch(decon_id, rsc->rsc_ch, i);
 		len_chs += sprintf(str_chs + len_chs, "%d[%c] ", i,
 				using_ch ? 'O' : 'X');
 
-		using_win = is_decon_using_win(0, rsc->rsc_win, i);
+		using_win = is_decon_using_win(decon_id, rsc->rsc_win, i);
 		len_wins += sprintf(str_wins + len_wins, "%d[%c] ", i,
 				using_win ? 'O' : 'X');
 	}
@@ -499,36 +518,76 @@ static int dpu_print_log_partial(char *buf, int len, struct dpu_log_partial *p)
 static const char *get_event_name(enum dpu_event_type type)
 {
 	static const char events[][32] = {
-		"NONE",				"DECON_ENABLED",
-		"DECON_DISABLED",		"DECON_FRAMEDONE",
-		"DECON_FRAMESTART",		"DECON_RSC_OCCUPANCY",
-		"DECON_TRIG_MASK",		"DSIM_ENABLED",
-		"DSIM_DISABLED",		"DSIM_COMMAND",
-		"DSIM_ULPS_ENTER",		"DSIM_ULPS_EXIT",
-		"DSIM_UNDERRUN",		"DSIM_FRAMEDONE",
-		"DSIM_PH_FIFO_TIMEOUT",		"DSIM_PL_FIFO_TIMEOUT",
-		"DPP_FRAMEDONE",		"DMA_RECOVERY",
-		"IDMA_AFBC_CONFLICT",		"IDMA_FBC_ERROR",
-		"IDMA_READ_SLAVE_ERROR",	"IDMA_DEADLOCK",
-		"IDMA_CFG_ERROR",		"ATOMIC_COMMIT",
-		"TE_INTERRUPT",			"DECON_RUNTIME_SUSPEND",
-		"DECON_RUNTIME_RESUME",		"ENTER_HIBERNATION_IN",
-		"ENTER_HIBERNATION_OUT",	"EXIT_HIBERNATION_IN",
-		"EXIT_HIBERNATION_OUT",		"ATOMIC_BEGIN",
-		"ATOMIC_FLUSH",			"WB_ENABLE",
-		"WB_DISABLE",			"WB_ATOMIC_COMMIT",
-		"WB_FRAMEDONE",			"WB_ENTER_HIBERNATION",
-		"WB_EXIT_HIBERNATION",		"PREPARE_FB",
-		"CLEANUP_FB",			"PLANE_UPDATE",
-		"PLANE_DISABLE",		"REQ_CRTC_INFO_OLD",
-		"REQ_CRTC_INFO_NEW",		"FRAMESTART_TIMEOUT",
-		"BTS_RELEASE_BW",		"BTS_CALC_BW",
-		"BTS_UPDATE_BW",		"PARTIAL_INIT",
-		"PARTIAL_PREPARE",		"PARTIAL_UPDATE",
-		"PARTIAL_PESTORE",		"DSIM_CRC",
-		"DSIM_ECC",			"VBLANK_ENABLE",
-		"VBLANK_DISABLE",		"DIMMING_START",
-		"DIMMING_END",			"CGC_FRAMEDONE",
+		"NONE",
+		"DECON_ENABLED",
+		"DECON_DISABLED",
+		"DECON_FRAMEDONE",
+		"DECON_FRAMESTART",
+		"DECON_RSC_OCCUPANCY",
+		"DECON_TRIG_MASK",
+		"DECON_UPDATE_CONFIG",
+		"DSIM_ENABLED",
+		"DSIM_DISABLED",
+		"DSIM_COMMAND",
+		"DSIM_ULPS_ENTER",
+		"DSIM_ULPS_EXIT",
+		"DSIM_UNDERRUN",
+		"DSIM_FRAMEDONE",
+		"DSIM_PH_FIFO_TIMEOUT",
+		"DSIM_PL_FIFO_TIMEOUT",
+		"DPP_FRAMEDONE",
+		"DPP_SET_PROTECTION",
+		"DMA_RECOVERY",
+		"IDMA_AFBC_CONFLICT",
+		"IDMA_FBC_ERROR",
+		"IDMA_READ_SLAVE_ERROR",
+		"IDMA_DEADLOCK",
+		"IDMA_CFG_ERROR",
+		"ATOMIC_COMMIT",
+		"TE_INTERRUPT",
+		"DECON_RUNTIME_SUSPEND",
+		"DECON_RUNTIME_RESUME",
+		"DECON_SUSPEND",
+		"DECON_RESUME",
+		"DSIM_RUNTIME_SUSPEND",
+		"DSIM_RUNTIME_RESUME",
+		"DSIM_SUSPEND",
+		"DSIM_RESUME",
+		"ENTER_HIBERNATION_IN",
+		"ENTER_HIBERNATION_OUT",
+		"EXIT_HIBERNATION_IN",
+		"EXIT_HIBERNATION_OUT",
+		"ATOMIC_BEGIN",
+		"ATOMIC_FLUSH",
+		"WB_ENABLE",
+		"WB_DISABLE",
+		"WB_ATOMIC_COMMIT",
+		"WB_FRAMEDONE",
+		"WB_ENTER_HIBERNATION",
+		"WB_EXIT_HIBERNATION",
+		"PREPARE_FB",
+		"CLEANUP_FB",
+		"PLANE_UPDATE",
+		"PLANE_DISABLE",
+		"REQ_CRTC_INFO_OLD",
+		"REQ_CRTC_INFO_NEW",
+		"FRAMESTART_TIMEOUT",
+		"BTS_RELEASE_BW",
+		"BTS_CALC_BW",
+		"BTS_UPDATE_BW",
+		"PARTIAL_INIT",
+		"PARTIAL_PREPARE",
+		"PARTIAL_UPDATE",
+		"PARTIAL_PESTORE",
+		"DSIM_CRC",
+		"DSIM_ECC",
+		"VBLANK_ENABLE",
+		"VBLANK_DISABLE",
+		"DIMMING_START",
+		"DIMMING_END",
+		"CGC_FRAMEDONE",
+		"ITMON_ERROR",
+		"SYSMMU_FAULT",
 	};
 
 	if (type >= DPU_EVT_MAX)
@@ -549,12 +608,18 @@ static bool is_skip_dpu_event_dump(enum dpu_event_type type, enum dpu_event_cond
 		case DPU_EVT_DSIM_COMMAND:
 		case DPU_EVT_DSIM_ULPS_ENTER:
 		case DPU_EVT_DSIM_ULPS_EXIT:
+		case DPU_EVT_DSIM_RUNTIME_SUSPEND:
+		case DPU_EVT_DSIM_RUNTIME_RESUME:
+		case DPU_EVT_DSIM_SUSPEND:
+		case DPU_EVT_DSIM_RESUME:
 		case DPU_EVT_DSIM_UNDERRUN:
 		case DPU_EVT_DSIM_FRAMEDONE:
 		case DPU_EVT_ATOMIC_COMMIT:
 		case DPU_EVT_TE_INTERRUPT:
 		case DPU_EVT_DECON_RUNTIME_SUSPEND:
 		case DPU_EVT_DECON_RUNTIME_RESUME:
+		case DPU_EVT_DECON_SUSPEND:
+		case DPU_EVT_DECON_RESUME:
 		case DPU_EVT_ENTER_HIBERNATION_IN:
 		case DPU_EVT_ENTER_HIBERNATION_OUT:
 		case DPU_EVT_EXIT_HIBERNATION_IN:
@@ -594,6 +659,10 @@ static bool is_skip_dpu_event_dump(enum dpu_event_type type, enum dpu_event_cond
 		case DPU_EVT_DSIM_COMMAND:
 		case DPU_EVT_DSIM_ULPS_ENTER:
 		case DPU_EVT_DSIM_ULPS_EXIT:
+		case DPU_EVT_DSIM_RUNTIME_SUSPEND:
+		case DPU_EVT_DSIM_RUNTIME_RESUME:
+		case DPU_EVT_DSIM_SUSPEND:
+		case DPU_EVT_DSIM_RESUME:
 		case DPU_EVT_DSIM_FRAMEDONE:
 		case DPU_EVT_DSIM_PH_FIFO_TIMEOUT:
 		case DPU_EVT_DSIM_PL_FIFO_TIMEOUT:
@@ -601,6 +670,8 @@ static bool is_skip_dpu_event_dump(enum dpu_event_type type, enum dpu_event_cond
 		case DPU_EVT_TE_INTERRUPT:
 		case DPU_EVT_DECON_RUNTIME_SUSPEND:
 		case DPU_EVT_DECON_RUNTIME_RESUME:
+		case DPU_EVT_DECON_SUSPEND:
+		case DPU_EVT_DECON_RESUME:
 		case DPU_EVT_ENTER_HIBERNATION_OUT:
 		case DPU_EVT_EXIT_HIBERNATION_OUT:
 		case DPU_EVT_ATOMIC_BEGIN:
@@ -611,22 +682,31 @@ static bool is_skip_dpu_event_dump(enum dpu_event_type type, enum dpu_event_cond
 		}
 	}
 
-	if (condition == DPU_EVT_CONDITION_IDMA_ERROR) {
+	if (condition == DPU_EVT_CONDITION_IDMA_ERROR ||
+		condition == DPU_EVT_CONDITION_IDMA_ERROR_COMPACT) {
 		switch (type) {
 		case DPU_EVT_DECON_FRAMEDONE:
 		case DPU_EVT_DECON_FRAMESTART:
 		case DPU_EVT_DSIM_FRAMEDONE:
 		case DPU_EVT_DPP_FRAMEDONE:
 		case DPU_EVT_DMA_RECOVERY:
+		case DPU_EVT_DPP_SET_PROTECTION:
 		case DPU_EVT_IDMA_AFBC_CONFLICT:
 		case DPU_EVT_IDMA_FBC_ERROR:
 		case DPU_EVT_IDMA_READ_SLAVE_ERROR:
 		case DPU_EVT_IDMA_DEADLOCK:
 		case DPU_EVT_IDMA_CFG_ERROR:
+		case DPU_EVT_SYSMMU_FAULT:
 		case DPU_EVT_ATOMIC_COMMIT:
 		case DPU_EVT_TE_INTERRUPT:
+		case DPU_EVT_DSIM_RUNTIME_SUSPEND:
+		case DPU_EVT_DSIM_RUNTIME_RESUME:
+		case DPU_EVT_DSIM_SUSPEND:
+		case DPU_EVT_DSIM_RESUME:
 		case DPU_EVT_DECON_RUNTIME_SUSPEND:
 		case DPU_EVT_DECON_RUNTIME_RESUME:
+		case DPU_EVT_DECON_SUSPEND:
+		case DPU_EVT_DECON_RESUME:
 		case DPU_EVT_ENTER_HIBERNATION_OUT:
 		case DPU_EVT_EXIT_HIBERNATION_OUT:
 		case DPU_EVT_ATOMIC_BEGIN:
@@ -650,7 +730,8 @@ static void dpu_event_log_print(const struct decon_device *decon, struct drm_pri
 	struct dpu_log dump_log;
 	struct dpu_log *log = &dump_log;
 	int latest = idx % dpu_event_log_max;
-	struct timespec64 ts;
+	unsigned long rem_nsec;
+	u64 ts;
 	const char *str_comp;
 	char buf[LOG_BUF_SIZE];
 	const struct dpu_fmt *fmt;
@@ -685,19 +766,18 @@ static void dpu_event_log_print(const struct decon_device *decon, struct drm_pri
 		if (is_skip_dpu_event_dump(log->type, condition))
 			continue;
 
-		/* TIME */
-		ts = ktime_to_timespec64(log->time);
-
 		/* If there is no timestamp, then exit directly */
-		if (!ts.tv_sec)
+		ts = log->ts_nsec;
+		if (!ts)
 			break;
 
-		len = scnprintf(buf, sizeof(buf), "[%6lld.%06ld] %20s", ts.tv_sec,
-				ts.tv_nsec / NSEC_PER_USEC, get_event_name(log->type));
+		rem_nsec = do_div(ts, 1000000000);
+		len = scnprintf(buf, sizeof(buf), "[%6llu.%06lu] %20s",
+				ts, rem_nsec / 1000, get_event_name(log->type));
 
 		switch (log->type) {
 		case DPU_EVT_DECON_RSC_OCCUPANCY:
-			dpu_print_log_rsc(buf, len, &log->data.rsc);
+			dpu_print_log_rsc(buf, len, decon->id, &log->data.rsc);
 			break;
 		case DPU_EVT_DSIM_COMMAND:
 			scnprintf(buf + len, sizeof(buf) - len,
@@ -707,12 +787,19 @@ static void dpu_event_log_print(const struct decon_device *decon, struct drm_pri
 			break;
 		case DPU_EVT_DPP_FRAMEDONE:
 			scnprintf(buf + len, sizeof(buf) - len,
-					"\tID:%u WIN:%u", log->data.dpp.id, log->data.dpp.win_id);
+					"\tCH:%u WIN:%u", log->data.dpp.id, log->data.dpp.win_id);
+			break;
+		case DPU_EVT_DPP_SET_PROTECTION:
+			scnprintf(buf + len, sizeof(buf) - len,
+					"\tID:%u mst_security:%#x PID: %d",
+					log->data.dpp.id,
+					log->data.dpp.mst_security,
+					log->data.dpp.last_secure_pid);
 			break;
 		case DPU_EVT_DMA_RECOVERY:
 			str_comp = get_comp_src_name(log->data.dpp.comp_src);
 			scnprintf(buf + len, sizeof(buf) - len,
-					"\tID:%u WIN:%u SRC:%s COUNT:%u",
+					"\tCH:%u WIN:%u SRC:%s COUNT:%u",
 					log->data.dpp.id, log->data.dpp.win_id,
 					str_comp, log->data.dpp.recovery_cnt);
 			break;
@@ -728,6 +815,8 @@ static void dpu_event_log_print(const struct decon_device *decon, struct drm_pri
 			break;
 		case DPU_EVT_DECON_RUNTIME_SUSPEND:
 		case DPU_EVT_DECON_RUNTIME_RESUME:
+		case DPU_EVT_DECON_SUSPEND:
+		case DPU_EVT_DECON_RESUME:
 		case DPU_EVT_ENTER_HIBERNATION_IN:
 		case DPU_EVT_ENTER_HIBERNATION_OUT:
 		case DPU_EVT_EXIT_HIBERNATION_IN:
@@ -737,31 +826,52 @@ static void dpu_event_log_print(const struct decon_device *decon, struct drm_pri
 					log->data.pd.rpm_active ? "ON" : "OFF",
 					log->data.pd.decon_state);
 			break;
+		case DPU_EVT_DECON_UPDATE_CONFIG:
+			scnprintf(buf + len, sizeof(buf) - len,
+				  "\t%s mode, %s_trigger, out type:0x%x, dsi_mode:%d.(%dx%d@%dhz)",
+				  log->data.decon_cfg.mode.op_mode ? "command" : "video",
+				  log->data.decon_cfg.mode.trig_mode ? "sw" : "hw",
+				  log->data.decon_cfg.out_type, log->data.decon_cfg.mode.dsi_mode,
+				  log->data.decon_cfg.image_width, log->data.decon_cfg.image_height,
+				  log->data.decon_cfg.fps);
+			break;
+		case DPU_EVT_DSIM_RUNTIME_SUSPEND:
+		case DPU_EVT_DSIM_RUNTIME_RESUME:
+		case DPU_EVT_DSIM_SUSPEND:
+		case DPU_EVT_DSIM_RESUME:
+			scnprintf(buf + len, sizeof(buf) - len,
+				  "\tDPU POWER:%s DSIM STATE:%u DSIM POWER:%s",
+				  log->data.pd.rpm_active ? "ON" : "OFF", log->data.pd.dsim_state,
+				  log->data.pd.dsim_rpm_active ? "ON" : "OFF");
+			break;
 		case DPU_EVT_PLANE_PREPARE_FB:
 		case DPU_EVT_PLANE_CLEANUP_FB:
 			fmt = dpu_find_fmt_info(log->data.plane_info.format);
-			scnprintf(buf + len, sizeof(buf) - len, "\tWIN%u: 0x%llx, %ux%u, CH%u, %s",
-				  log->data.plane_info.zpos, log->data.plane_info.dma_addr,
-				  log->data.plane_info.width, log->data.plane_info.height,
-				  log->data.plane_info.index, dpu_get_fmt_name(fmt));
+			scnprintf(buf + len, sizeof(buf) - len, "\tCH%u: 0x%llx, %ux%u, ZPOS%u, %s",
+				PLANE2DPPCH(log->data.plane_info.index),
+				log->data.plane_info.dma_addr,
+				log->data.plane_info.width, log->data.plane_info.height,
+				log->data.plane_info.zpos, dpu_get_fmt_name(fmt));
 			break;
 		case DPU_EVT_PLANE_UPDATE:
 		case DPU_EVT_PLANE_DISABLE:
 			scnprintf(buf + len, sizeof(buf) - len,
-					"\tCH:%d, WIN:%d",
+					"\tCH:%d, WIN:%d, %s",
 					log->data.win.plane_idx,
-					log->data.win.win_idx);
+					log->data.win.win_idx,
+					log->data.win.secure ? "SECURE" : "");
 			break;
 		case DPU_EVT_REQ_CRTC_INFO_OLD:
 		case DPU_EVT_REQ_CRTC_INFO_NEW:
 			scnprintf(buf + len, sizeof(buf) - len,
-				"\tenable(%d) active(%d) sr(%d) [p:%d m:%d a:%d]",
+				"\tenable(%d) active(%d) sr(%d) [p:%d m:%d a:%d c:%d]",
 					log->data.crtc_info.enable,
 					log->data.crtc_info.active,
 					log->data.crtc_info.self_refresh,
 					log->data.crtc_info.planes_changed,
 					log->data.crtc_info.mode_changed,
-					log->data.crtc_info.active_changed);
+					log->data.crtc_info.active_changed,
+					log->data.crtc_info.connectors_changed);
 			break;
 		case DPU_EVT_BTS_RELEASE_BW:
 		case DPU_EVT_BTS_UPDATE_BW:
@@ -769,10 +879,11 @@ static void dpu_event_log_print(const struct decon_device *decon, struct drm_pri
 			break;
 		case DPU_EVT_BTS_CALC_BW:
 			scnprintf(buf + len, sizeof(buf) - len,
-					"\tdisp(%u) peak(%u) rt(%u) read(%u) write(%u) %uhz",
+					"\tdisp(%u) peak(%u) rt(%u) read(%u) write(%u) %uhz (crtc: %uhz)",
 					log->data.bts_cal.disp_freq, log->data.bts_cal.peak,
 					log->data.bts_cal.rt_avg_bw, log->data.bts_cal.read_bw,
-					log->data.bts_cal.write_bw, log->data.bts_cal.fps);
+					log->data.bts_cal.write_bw, log->data.bts_cal.fps,
+					log->data.bts_cal.crtc_fps);
 			break;
 		case DPU_EVT_DSIM_UNDERRUN:
 			scnprintf(buf + len, sizeof(buf) - len,
@@ -1333,6 +1444,34 @@ err:
 	debugfs_remove_recursive(dent_dir);
 }
 
+static ssize_t counters_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	uint32_t underrun_cnt, crc_cnt, ecc_cnt, idma_err_cnt;
+	const struct decon_device *decon = to_decon_device(dev);
+
+	if (!decon)
+		return -ENODEV;
+
+	underrun_cnt = decon->d.underrun_cnt;
+	crc_cnt = decon->d.crc_cnt;
+	ecc_cnt = decon->d.ecc_cnt;
+	idma_err_cnt = decon->d.idma_err_cnt;
+
+	return snprintf(buf, PAGE_SIZE,
+			"underrun: %u\n"
+			"crc: %u\n"
+			"ecc: %u\n"
+			"idma_error: %u\n",
+			underrun_cnt, crc_cnt, ecc_cnt, idma_err_cnt);
+}
+
+static DEVICE_ATTR_RO(counters);
+
+static const struct attribute *decon_debug_attrs[] = {
+	&dev_attr_counters.attr,
+	NULL
+};
+
 static int hibernation_show(struct seq_file *s, void *unused)
 {
 	struct decon_device *decon = s->private;
@@ -1490,6 +1629,7 @@ int dpu_init_debug(struct decon_device *decon)
 	struct exynos_dqe *dqe = decon->dqe;
 	struct dentry *debug_event;
 	struct dentry *urgent_dent;
+	int ret;
 
 	decon->d.event_log = NULL;
 	event_cnt = dpu_event_log_max;
@@ -1534,6 +1674,11 @@ int dpu_init_debug(struct decon_device *decon)
 		DRM_ERROR("failed to create debugfs recovery file\n");
 		goto err_debugfs;
 	}
+
+	/* Create sysfs nodes */
+	ret = sysfs_create_files(&decon->dev->kobj, decon_debug_attrs);
+	if (ret)
+		pr_warn("unable to add decon_debug sysfs files (%d)\n", ret);
 
 	debugfs_create_file("force_te_on", 0664, crtc->debugfs_entry, decon, &force_te_fops);
 	debugfs_create_u32("underrun_cnt", 0664, crtc->debugfs_entry, &decon->d.underrun_cnt);
@@ -1744,7 +1889,10 @@ void dpu_print_hex_dump(struct drm_printer *p, void __iomem *regs, const void *b
 		else
 			linelen = ROW_LEN;
 
-		snprintf(prefix_buf, sizeof(prefix_buf), "[%08lX] ", offset);
+		if (regs)
+			snprintf(prefix_buf, sizeof(prefix_buf), "[%08lX] ", offset);
+		else
+			snprintf(prefix_buf, sizeof(prefix_buf), "[%08X] ", i);
 		hex_dump_to_buffer(ptr, linelen, ROW_LEN, 4,
 				linebuf, sizeof(linebuf), false);
 
@@ -1752,7 +1900,7 @@ void dpu_print_hex_dump(struct drm_printer *p, void __iomem *regs, const void *b
 	}
 }
 
-static bool decon_dump_ignore(enum dpu_event_condition condition)
+bool decon_dump_ignore(enum dpu_event_condition condition)
 {
 	return !(dpu_debug_dump_mask & condition);
 }
@@ -1760,11 +1908,8 @@ static bool decon_dump_ignore(enum dpu_event_condition condition)
 void decon_dump_all(struct decon_device *decon,
 		enum dpu_event_condition condition, bool async_buf_dump)
 {
-	bool active = pm_runtime_active(decon->dev);
+	bool active;
 	struct kthread_worker *worker = &decon->worker;
-
-	pr_info("%s: power %s state\n",
-		dev_name(decon->dev), active ? "on" : "off");
 
 	if (decon_dump_ignore(condition))
 		return;
@@ -1777,10 +1922,16 @@ void decon_dump_all(struct decon_device *decon,
 			buf_dump_all(decon);
 	}
 
+	active = pm_runtime_get_if_in_use(decon->dev) == 1;
+	pr_info("%s: power %s state\n",
+		dev_name(decon->dev), active ? "on" : "off");
+
 	decon_dump_event_condition(decon, condition);
 
-	if (active)
+	if (active) {
 		decon_dump(decon);
+		pm_runtime_put(decon->dev);
+	}
 }
 
 void decon_dump_event_condition(const struct decon_device *decon,
@@ -1797,6 +1948,7 @@ void decon_dump_event_condition(const struct decon_device *decon,
 	case DPU_EVT_CONDITION_UNDERRUN:
 	case DPU_EVT_CONDITION_FIFO_TIMEOUT:
 	case DPU_EVT_CONDITION_IDMA_ERROR:
+	case DPU_EVT_CONDITION_IDMA_ERROR_COMPACT:
 		print_log_size = dpu_event_print_underrun;
 		break;
 	case DPU_EVT_CONDITION_FAIL_UPDATE_BW:
@@ -1812,6 +1964,32 @@ void decon_dump_event_condition(const struct decon_device *decon,
 }
 
 #if IS_ENABLED(CONFIG_EXYNOS_ITMON)
+
+#define MAX_DPU_ITMON_STR_NUM 2
+static bool dpu_itmon_check(struct decon_device *decon, char *str_itmon, char *str_attr)
+{
+	const char *name[MAX_DPU_ITMON_STR_NUM];
+	int count, i;
+
+	if (!str_itmon)
+		return false;
+
+	count = of_property_count_strings(decon->dev->of_node, str_attr);
+	if (count <= 0 || count > MAX_DPU_ITMON_STR_NUM) {
+		pr_warn("%s: invalid number: %d\n", __func__, count);
+		return false;
+	}
+
+	of_property_read_string_array(decon->dev->of_node,
+				      str_attr, name, count);
+	for (i = 0; i < count; i++) {
+		if (strncmp(str_itmon, name[i], strlen(name[i])) == 0)
+			return true;
+	}
+
+	return false;
+}
+
 int dpu_itmon_notifier(struct notifier_block *nb, unsigned long act, void *data)
 {
 	struct decon_device *decon;
@@ -1828,10 +2006,9 @@ int dpu_itmon_notifier(struct notifier_block *nb, unsigned long act, void *data)
 		return NOTIFY_DONE;
 
 	/* port is master and dest is target */
-	if ((itmon_data->port &&
-		(strncmp("DISP", itmon_data->port, sizeof("DISP") - 1) == 0)) ||
-		(itmon_data->dest &&
-		(strncmp("DISP", itmon_data->dest, sizeof("DISP") - 1) == 0))) {
+	if (dpu_itmon_check(decon, itmon_data->port, "itmon,port") ||
+	    dpu_itmon_check(decon, itmon_data->dest, "itmon,dest")) {
+		DPU_EVENT_LOG(DPU_EVT_ITMON_ERROR, decon->id, NULL);
 		pr_info("%s: port: %s, dest: %s\n", __func__,
 				itmon_data->port, itmon_data->dest);
 

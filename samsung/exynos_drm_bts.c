@@ -343,7 +343,7 @@ static u64 dpu_bts_calc_aclk_disp(struct decon_device *decon,
 				  const struct dpu_bts_win_config *config, u64 resol_clk,
 				  u32 max_clk)
 {
-	u64 aclk_disp, aclk_base, aclk_disp_khz;
+	u64 aclk_disp, aclk_base, aclk_panel_khz, aclk_disp_khz;
 	u32 ppc;
 	u32 src_w, src_h;
 	u32 diff_w, ratio_v;
@@ -362,12 +362,16 @@ static u64 dpu_bts_calc_aclk_disp(struct decon_device *decon,
 	if (src_w > config->dst_w || src_h > config->dst_h)
 		is_downscale = true;
 
-	/* case for using dsc encoder 1ea at decon0 or decon1 */
-	if ((decon->id != 2) && (decon->config.dsc.dsc_count == 1))
-		ppc = ((decon->bts.ppc / 2UL) >= 1UL) ?
-				(decon->bts.ppc / 2UL) : 1UL;
-	else
+	/* when calculating aclk for panel, if DSC is enabled, consider DSC encoder
+	 * count as its ppc.
+	 */
+	if (decon->config.dsc.enabled) {
+		ppc = min(decon->bts.ppc, decon->config.dsc.dsc_count);
+		is_dsc = true;
+	} else {
 		ppc = decon->bts.ppc;
+	}
+	aclk_panel_khz = resol_clk / ppc;
 
 	margin = 1100 + ((48000 + 20000) / decon->config.image_width);
 	diff_w = (src_w <= config->dst_w) ? 0 : src_w - config->dst_w;
@@ -389,10 +393,10 @@ static u64 dpu_bts_calc_aclk_disp(struct decon_device *decon,
 	}
 	aclk_disp = mult_frac(aclk_disp, decon->config.image_height * decon->bts.fps, 1000);
 	aclk_disp_khz = (aclk_disp * margin / 1000) / 1000;
+	aclk_disp_khz /= decon->bts.ppc;
 
-	if (aclk_disp_khz < resol_clk)
-		aclk_disp_khz = resol_clk;
-	aclk_disp_khz /= ppc;
+	if (aclk_disp_khz < aclk_panel_khz)
+		aclk_disp_khz = aclk_panel_khz;
 
 	if (!config->is_rot)
 		return aclk_disp_khz;
@@ -403,35 +407,54 @@ static u64 dpu_bts_calc_aclk_disp(struct decon_device *decon,
 	else
 		aclk_base = max_clk;
 
-	if (decon->config.dsc.enabled)
-		is_dsc = true;
-
 	aclk_disp_khz = dpu_bts_calc_rotate_aclk(decon, (u32)aclk_base, ppc,
 			src_w, config->dst_w, config->is_comp, is_downscale, is_dsc);
 
 	return aclk_disp_khz;
 }
 
-static void dpu_bts_sum_all_decon_bw(struct decon_device *decon, u32 ch_bw[])
+static void dpu_bts_sum_all_decon_bw(u32 id, u32 *max_overlap_bw, u32 *max_disp_ch_bw)
 {
 	int i, j;
+	struct decon_device *decon;
+	u32 overlap_bw = 0, disp_ch_bw[MAX_AXI_PORT] = { 0 };
 
-	if (decon->id < 0 || decon->id >= MAX_DECON_CNT) {
-		DPU_INFO_BTS("[%s] undefined decon id(%u)!\n", __func__,
-				decon->id);
+	if (id < 0 || id >= MAX_DECON_CNT) {
+		DPU_ERR_BTS("[%s] undefined decon id(%u)!\n", __func__, id);
+		*max_overlap_bw = 0;
+		*max_disp_ch_bw = 0;
 		return;
 	}
 
-	for (i = 0; i < MAX_AXI_PORT; ++i)
-		decon->bts.ch_bw[decon->id][i] = ch_bw[i];
-
-	for (i = 0; i < MAX_DECON_CNT; ++i) {
-		if (decon->id == i)
+	for (i = 0; i < MAX_DECON_CNT; i++) {
+		decon = get_decon_drvdata(i);
+		if (decon == NULL)
 			continue;
 
-		for (j = 0; j < MAX_AXI_PORT; ++j)
-			ch_bw[j] += decon->bts.ch_bw[i][j];
+		if (decon->bts.rt_avg_bw) {
+			overlap_bw += decon->bts.rt_avg_bw;
+			if (decon->id != id)
+				DPU_DEBUG_BTS("    add DECON%d Overlap BW = %u\n",
+					i, decon->bts.rt_avg_bw);
+		}
+
+		for (j = 0; j < MAX_AXI_PORT; j++) {
+			if (decon->bts.ch_bw[j]) {
+				disp_ch_bw[j] += decon->bts.ch_bw[j];
+				if (decon->id != id)
+					DPU_DEBUG_BTS("    add DECON%d AXI_DPU%d = %u\n",
+						i, j, decon->bts.ch_bw[j]);
+			}
+		}
 	}
+
+	*max_overlap_bw = overlap_bw;
+	*max_disp_ch_bw = disp_ch_bw[0];
+	for (i = 1; i < MAX_AXI_PORT; i++)
+		*max_disp_ch_bw = max(*max_disp_ch_bw, disp_ch_bw[i]);
+
+	DPU_DEBUG_BTS("  Max Overlap BW = %u, Max AXI_DPU = %u\n",
+		*max_overlap_bw, *max_disp_ch_bw);
 }
 
 static u32 dpu_bts_calc_disp_with_full_size(struct decon_device *decon)
@@ -475,12 +498,20 @@ static bool is_win_half_covered(const struct dpu_bts_win_config *config0,
 	return false;
 }
 
-static u32 dpu_bts_find_max_overlap_bw(struct decon_device *decon,
+static u32 dpu_bts_get_rt_bw(struct decon_device *decon,
+				const struct dpu_bts_win_config *win_config)
+{
+	const u32 plane_id = DPPCH2PLANE(win_config->dpp_id);
+
+	return decon->bts.rt_bw[plane_id].val;
+}
+
+static void dpu_bts_update_overlap_bw(struct decon_device *decon,
 				       const struct dpu_bts_win_config *win_config,
 				       const struct dpu_bts_win_config *rcd_config)
 {
 	int i, j;
-	u32 max_overlap_bw = 0, rcd_max_overlap_bw = 0;
+	u32 win_max_overlap_bw = 0, rcd_max_overlap_bw = 0;
 
 	/* overlap rt bandwidth requirement */
 	/* TODO: take write rt bandwidth into account */
@@ -495,51 +526,42 @@ static u32 dpu_bts_find_max_overlap_bw(struct decon_device *decon,
 			if (win_config[j].state != DPU_WIN_STATE_BUFFER)
 				continue;
 
-			if (is_win_half_covered(&win_config[i], &win_config[j])) {
-				int dpp_ch = win_config[j].dpp_ch;
-
-				overlap_bw += decon->bts.rt_bw[dpp_ch].val;
-			}
+			if (is_win_half_covered(&win_config[i], &win_config[j]))
+				overlap_bw += dpu_bts_get_rt_bw(decon, &win_config[j]);
 		}
 
 		if (rcd_config->state == DPU_WIN_STATE_BUFFER) {
-			int dpp_ch = win_config[i].dpp_ch;
-			int rcd_dpp_ch = rcd_config->dpp_ch;
-
 			if (is_win_half_covered(&win_config[i], rcd_config))
-				overlap_bw += decon->bts.rt_bw[rcd_dpp_ch].val;
+				overlap_bw += dpu_bts_get_rt_bw(decon, rcd_config);
 
 			if (is_win_half_covered(rcd_config, &win_config[i]))
-				rcd_max_overlap_bw += decon->bts.rt_bw[dpp_ch].val;
+				rcd_max_overlap_bw += dpu_bts_get_rt_bw(decon, &win_config[i]);
 		}
 
 		DPU_DEBUG_BTS("  Overlap BW%d = %u\n", i, overlap_bw);
-		max_overlap_bw = max(max_overlap_bw, overlap_bw);
+		win_max_overlap_bw = max(win_max_overlap_bw, overlap_bw);
 	}
 
-	if (rcd_config->state == DPU_WIN_STATE_BUFFER) {
-		int rcd_dpp_ch = rcd_config->dpp_ch;
+	if (rcd_config->state == DPU_WIN_STATE_BUFFER)
+		rcd_max_overlap_bw += dpu_bts_get_rt_bw(decon, rcd_config);
 
-		rcd_max_overlap_bw += decon->bts.rt_bw[rcd_dpp_ch].val;
-	}
-
-	return max(max_overlap_bw, rcd_max_overlap_bw);
+	decon->bts.rt_avg_bw = max(win_max_overlap_bw, rcd_max_overlap_bw);
 }
 
-static u32 dpu_bts_find_max_disp_ch_bw(struct decon_device *decon,
+static void dpu_bts_update_disp_ch_bw(struct decon_device *decon,
 				       const struct dpu_bts_win_config *win_config,
 				       const struct dpu_bts_win_config *rcd_config)
 {
 	int i, j;
 	u32 disp_ch_bw[MAX_AXI_PORT];
-	u32 max_disp_ch_bw, rcd_overlap_ch_bw = 0;
+	u32 rcd_overlap_ch_bw = 0;
 
 	/* DPU AXI bandwidth requirement */
 	/* TODO: take write rt bandwidth into account */
 	memset(disp_ch_bw, 0, sizeof(disp_ch_bw));
 	for (i = 0; i < decon->win_cnt; i++) {
-		int dpp_ch = win_config[i].dpp_ch;
-		u32 ch_num = decon->bts.rt_bw[dpp_ch].ch_num;
+		u32 dpp_id = win_config[i].dpp_id;
+		u32 ch_num = decon->bts.rt_bw[DPPCH2PLANE(dpp_id)].ch_num;
 		u32 overlap_ch_bw;
 
 		if (win_config[i].state != DPU_WIN_STATE_BUFFER)
@@ -552,54 +574,48 @@ static u32 dpu_bts_find_max_disp_ch_bw(struct decon_device *decon,
 
 		overlap_ch_bw = 0;
 		for (j = 0; j < decon->win_cnt; j++) {
-			int dpp_ch = win_config[j].dpp_ch;
+			int dpp_id = win_config[j].dpp_id;
 
 			if (win_config[j].state != DPU_WIN_STATE_BUFFER)
 				continue;
 
-			if (ch_num == decon->bts.rt_bw[dpp_ch].ch_num &&
+			if (ch_num == decon->bts.rt_bw[DPPCH2PLANE(dpp_id)].ch_num &&
 				(is_win_half_covered(&win_config[i], &win_config[j])))
-				overlap_ch_bw += decon->bts.rt_bw[dpp_ch].val;
+				overlap_ch_bw += dpu_bts_get_rt_bw(decon, &win_config[j]);
 		}
 
 		if (rcd_config->state == DPU_WIN_STATE_BUFFER) {
-			int rcd_dpp_ch = rcd_config->dpp_ch;
+			u32 rcd_dpp_id = rcd_config->dpp_id;
 
-			if (ch_num == decon->bts.rt_bw[rcd_dpp_ch].ch_num) {
+			if (ch_num == decon->bts.rt_bw[DPPCH2PLANE(rcd_dpp_id)].ch_num) {
 				if (is_win_half_covered(&win_config[i], rcd_config))
-					overlap_ch_bw += decon->bts.rt_bw[rcd_dpp_ch].val;
+					overlap_ch_bw += dpu_bts_get_rt_bw(decon, rcd_config);
 
 				if (is_win_half_covered(rcd_config, &win_config[i]))
-					rcd_overlap_ch_bw += decon->bts.rt_bw[dpp_ch].val;
+					rcd_overlap_ch_bw +=
+						dpu_bts_get_rt_bw(decon, &win_config[i]);
 			}
 		}
 		disp_ch_bw[ch_num] = max(disp_ch_bw[ch_num], overlap_ch_bw);
 	}
 
 	if (rcd_config->state == DPU_WIN_STATE_BUFFER) {
-		int rcd_dpp_ch = rcd_config->dpp_ch;
-		u32 rcd_ch_num = decon->bts.rt_bw[rcd_dpp_ch].ch_num;
+		u32 rcd_dpp_id = rcd_config->dpp_id;
+		u32 rcd_ch_num = decon->bts.rt_bw[DPPCH2PLANE(rcd_dpp_id)].ch_num;
 
 		if (rcd_ch_num >= MAX_AXI_PORT) {
 			pr_err("invalid RCD AXI channel number %u\n", rcd_ch_num);
 		} else {
-			rcd_overlap_ch_bw += decon->bts.rt_bw[rcd_dpp_ch].val;
+			rcd_overlap_ch_bw += dpu_bts_get_rt_bw(decon, rcd_config);
 			disp_ch_bw[rcd_ch_num] = max(disp_ch_bw[rcd_ch_num], rcd_overlap_ch_bw);
 		}
 	}
 
-	/* must be considered other decon's bw */
-	dpu_bts_sum_all_decon_bw(decon, disp_ch_bw);
-
-	for (i = 0; i < MAX_AXI_PORT; ++i)
-		if (disp_ch_bw[i])
-			DPU_DEBUG_BTS("  AXI_DPU%d = %u\n", i, disp_ch_bw[i]);
-
-	max_disp_ch_bw = disp_ch_bw[0];
-	for (i = 1; i < MAX_AXI_PORT; ++i)
-		max_disp_ch_bw = max(max_disp_ch_bw, disp_ch_bw[i]);
-
-	return max_disp_ch_bw;
+	for (i = 0; i < MAX_AXI_PORT; ++i) {
+		decon->bts.ch_bw[i] = disp_ch_bw[i];
+		if (decon->bts.ch_bw[i])
+			DPU_DEBUG_BTS("  AXI_DPU%d = %u\n", i, decon->bts.ch_bw[i]);
+	}
 }
 
 static void dpu_bts_find_max_disp_freq(struct decon_device *decon)
@@ -611,8 +627,10 @@ static void dpu_bts_find_max_disp_freq(struct decon_device *decon)
 	const struct dpu_bts_win_config *win_config = decon->bts.win_config;
 	const struct dpu_bts_win_config *rcd_config = &decon->bts.rcd_win_config.win;
 
-	max_overlap_bw = dpu_bts_find_max_overlap_bw(decon, win_config, rcd_config);
-	max_disp_ch_bw = dpu_bts_find_max_disp_ch_bw(decon, win_config, rcd_config);
+	dpu_bts_update_overlap_bw(decon, win_config, rcd_config);
+	dpu_bts_update_disp_ch_bw(decon, win_config, rcd_config);
+	dpu_bts_sum_all_decon_bw(decon->id, &max_overlap_bw, &max_disp_ch_bw);
+
 	decon->bts.max_disp_freq = max_disp_ch_bw * 100 /
 			(decon->bts.bus_width * decon->bts.bus_util_pct);
 
@@ -623,7 +641,6 @@ static void dpu_bts_find_max_disp_freq(struct decon_device *decon)
 	 */
 	decon->bts.peak = max3(max_disp_ch_bw, max_overlap_bw / NUM_INTERCONNECT_CH,
 				decon->bts.write_bw);
-	decon->bts.rt_avg_bw = max_overlap_bw;
 
 	for (i = 0; i < decon->win_cnt; ++i) {
 		u32 freq;
@@ -653,29 +670,8 @@ static void dpu_bts_find_max_disp_freq(struct decon_device *decon)
 	DPU_DEBUG_BTS("  MAX DISP CH FREQ = %u\n", decon->bts.max_disp_freq);
 }
 
-static void dpu_bts_share_bw_info(int id)
-{
-	int i, j;
-	struct decon_device *decon[MAX_DECON_CNT];
-
-	for (i = 0; i < MAX_DECON_CNT; i++)
-		decon[i] = NULL;
-
-	for (i = 0; i < MAX_DECON_CNT; i++)
-		decon[i] = get_decon_drvdata(i);
-
-	for (i = 0; i < MAX_DECON_CNT; ++i) {
-		if (id == i || decon[i] == NULL)
-			continue;
-
-		for (j = 0; j < MAX_AXI_PORT; ++j)
-			decon[i]->bts.ch_bw[id][j] =
-				decon[id]->bts.ch_bw[id][j];
-	}
-}
-
 static void
-dpu_bts_calc_dpp_bw(struct bts_dpp_info *dpp, u32 fps, u32 lcd_h, u32 vblank_us, int idx,
+dpu_bts_calc_dpp_bw(struct bts_dpp_info *dpp, u32 fps, u32 lcd_h, u32 vblank_us, u32 dpp_id,
 		const struct dpu_bts *bts)
 {
 	u32 avg_bw, rt_bw, rot_bw = 0;
@@ -697,7 +693,7 @@ dpu_bts_calc_dpp_bw(struct bts_dpp_info *dpp, u32 fps, u32 lcd_h, u32 vblank_us,
 				USEC_PER_SEC, vblank_us) / 1000;
 	}
 
-	DPU_DEBUG_BTS("  DPP%d bandwidth: avg %u, rt %u, rot %u\n", idx, avg_bw, rt_bw, rot_bw);
+	DPU_DEBUG_BTS("  DPP%d bandwidth: avg %u, rt %u, rot %u\n", dpp_id, avg_bw, rt_bw, rot_bw);
 
 	rt_bw = max(rt_bw, rot_bw);
 	if (dpp->is_afbc) {
@@ -738,7 +734,7 @@ static void dpu_bts_convert_config_to_info(struct bts_dpp_info *dpp,
 	dpp->is_yuv = IS_YUV(fmt_info);
 
 	DPU_DEBUG_BTS("  DPP%d : bpp(%u) src w(%u) h(%u) rot(%d) afbc(%d) yuv(%d)\n",
-			DPU_DMA2CH(config->dpp_ch), dpp->bpp, dpp->src_w,
+			config->dpp_id, dpp->bpp, dpp->src_w,
 			dpp->src_h, dpp->rotation, dpp->is_afbc, dpp->is_yuv);
 	DPU_DEBUG_BTS("        dst x(%u) right(%u) y(%u) bottom(%u)\n",
 			dpp->dst.x1, dpp->dst.x2, dpp->dst.y1, dpp->dst.y2);
@@ -746,6 +742,8 @@ static void dpu_bts_convert_config_to_info(struct bts_dpp_info *dpp,
 
 static void dpu_bts_calc_bw(struct decon_device *decon)
 {
+	struct drm_crtc *crtc = &decon->crtc->base;
+	struct drm_crtc_state *crtc_state = crtc->state;
 	struct dpu_bts_win_config *config;
 	struct bts_decon_info bts_info;
 	int idx, i, wb_idx = -1, rcd_idx = -1;
@@ -779,20 +777,21 @@ static void dpu_bts_calc_bw(struct decon_device *decon)
 		if (config[i].state != DPU_WIN_STATE_BUFFER)
 			continue;
 
-		idx = config[i].dpp_ch;
+		idx = DPPCH2PLANE(config[i].dpp_id);
 		dpu_bts_convert_config_to_info(&bts_info.rdma[idx], &config[i]);
 		dpu_bts_calc_dpp_bw(&bts_info.rdma[idx], decon->bts.fps,
-				decon->config.image_height, vblank_us, idx, &decon->bts);
+				decon->config.image_height, vblank_us,
+				config[i].dpp_id, &decon->bts);
 		read_bw += bts_info.rdma[idx].bw;
 	}
 
 	/* write bw calculation */
 	config = &decon->bts.wb_config;
 	if (config->state == DPU_WIN_STATE_BUFFER) {
-		wb_idx = config->dpp_ch;
+		wb_idx = DPPCH2PLANE(config->dpp_id);
 		dpu_bts_convert_config_to_info(&bts_info.odma, config);
 		dpu_bts_calc_dpp_bw(&bts_info.odma, decon->bts.fps, bts_info.lcd_h,
-				vblank_us, wb_idx, &decon->bts);
+				vblank_us, config->dpp_id, &decon->bts);
 		write_bw = bts_info.odma.bw;
 	} else {
 		wb_idx = -1;
@@ -802,10 +801,10 @@ static void dpu_bts_calc_bw(struct decon_device *decon)
 	/* rcd bw calculation */
 	config = &decon->bts.rcd_win_config.win;
 	if (config->state == DPU_WIN_STATE_BUFFER) {
-		rcd_idx = config->dpp_ch;
+		rcd_idx = DPPCH2PLANE(config->dpp_id);
 		dpu_bts_convert_config_to_info(&bts_info.rcddma, config);
 		dpu_bts_calc_dpp_bw(&bts_info.rcddma, decon->bts.fps, bts_info.lcd_h,
-				vblank_us, rcd_idx, &decon->bts);
+				vblank_us, config->dpp_id, &decon->bts);
 		read_bw += bts_info.rcddma.bw;
 	} else {
 		rcd_idx = -1;
@@ -831,12 +830,16 @@ static void dpu_bts_calc_bw(struct decon_device *decon)
 			decon->id, decon->bts.total_bw, decon->bts.read_bw,
 			decon->bts.write_bw);
 
-	dpu_bts_find_max_disp_freq(decon);
+	if (decon->bts.total_bw) {
+		dpu_bts_find_max_disp_freq(decon);
+	} else {
+		/* no bw requirement */
+		decon->bts.peak = 0;
+		decon->bts.rt_avg_bw = 0;
+		decon->bts.max_disp_freq = dpu_bts_calc_disp_with_full_size(decon);
+	}
 
-	/* update bw for other decons */
-	dpu_bts_share_bw_info(decon->id);
-
-	DPU_EVENT_LOG(DPU_EVT_BTS_CALC_BW, decon->id, NULL);
+	DPU_EVENT_LOG(DPU_EVT_BTS_CALC_BW, decon->id, crtc_state);
 	DPU_DEBUG_BTS("%s -\n", __func__);
 }
 
@@ -882,6 +885,16 @@ static void dpu_bts_update_resources(struct decon_device *decon, bool shadow_upd
 	DPU_DEBUG_BTS("  peak = %u, rt = %u, read = %u, write = %u\n",
 		bw.peak, bw.rt, bw.read, bw.write);
 
+	/* When concurrent writeback is enabled, writeback instant off may occur if the outfifo
+	 * for writeback is full meanwhile the outfifo for LCD is not full yet.
+	 * We can limit max_disp_freq to avoid it when concurrent writeback is enabled.
+	 * Currently, the issue only occurs when all layers are solid color layers (read = 0).
+	 */
+	if ((decon->bts.max_dfs_lv_for_wb > 0) && (bw.read == 0) && (bw.write > 0)) {
+		decon->bts.max_disp_freq =
+			min(decon->bts.max_disp_freq, decon->bts.max_dfs_lv_for_wb);
+	}
+
 	if (shadow_updated) {
 		/* after DECON h/w configs are updated to shadow SFR */
 		if (decon->bts.total_bw < decon->bts.prev_total_bw ||
@@ -920,14 +933,16 @@ static void dpu_bts_release_resources(struct decon_device *decon)
 	if (!decon->bts.enabled)
 		return;
 
-	if (decon->config.out_type & DECON_OUT_DSI) {
-		dpu_bts_update_bw(decon, bw);
-		decon->bts.prev_peak = 0;
-		decon->bts.prev_rt_avg_bw = 0;
-		decon->bts.prev_total_bw = 0;
-		dpu_bts_update_disp(decon, 0);
-		decon->bts.prev_max_disp_freq = 0;
-	}
+	dpu_bts_update_bw(decon, bw);
+	decon->bts.prev_peak = 0;
+	decon->bts.prev_rt_avg_bw = 0;
+	decon->bts.prev_total_bw = 0;
+	dpu_bts_update_disp(decon, 0);
+	decon->bts.prev_max_disp_freq = 0;
+
+	// clear shared decon resources
+	decon->bts.rt_avg_bw = 0;
+	memset(decon->bts.ch_bw, 0, sizeof(decon->bts.ch_bw));
 
 	DPU_EVENT_LOG(DPU_EVT_BTS_RELEASE_BW, decon->id, NULL);
 	DPU_DEBUG_BTS("%s -\n", __func__);
@@ -959,8 +974,9 @@ static void dpu_bts_init(struct decon_device *decon)
 	decon->bts.dvfs_max_disp_freq =
 			(u32)cal_dfs_get_max_freq(ACPM_DVFS_DISP);
 
+	decon->bts.rt_avg_bw = 0;
 	for (i = 0; i < MAX_AXI_PORT; i++)
-		decon->bts.ch_bw[decon->id][i] = 0;
+		decon->bts.ch_bw[i] = 0;
 
 	DPU_DEBUG_BTS("BTS_BW_TYPE(%d)\n", decon->bts.bw_idx);
 	exynos_pm_qos_add_request(&decon->bts.mif_qos,
@@ -971,9 +987,9 @@ static void dpu_bts_init(struct decon_device *decon)
 					PM_QOS_DISPLAY_THROUGHPUT, 0);
 
 	for (i = 0; i < decon->dpp_cnt; ++i) { /* dma type order */
-		decon->bts.rt_bw[i].ch_num = decon->dpp[DPU_DMA2CH(i)]->port;
+		decon->bts.rt_bw[i].ch_num = decon->dpp[i]->port;
 		DPU_INFO_BTS("IDMA_TYPE(%d) CH(%d) Port(%u)\n", i,
-				DPU_DMA2CH(i), decon->bts.rt_bw[i].ch_num);
+				PLANE2DPPCH(i), decon->bts.rt_bw[i].ch_num);
 	}
 
 	drm_for_each_encoder(encoder, decon->drm_dev) {
@@ -981,7 +997,7 @@ static void dpu_bts_init(struct decon_device *decon)
 
 		if (encoder->encoder_type == DRM_MODE_ENCODER_VIRTUAL) {
 			wb = enc_to_wb_dev(encoder);
-			decon->bts.rt_bw[wb->id].ch_num = wb->port;
+			decon->bts.rt_bw[DPPCH2PLANE(wb->id)].ch_num = wb->port;
 			break;
 		}
 	}

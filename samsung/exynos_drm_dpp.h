@@ -36,6 +36,7 @@ enum EXYNOS9_DPP_FEATURES {
 enum dpp_state {
 	DPP_STATE_OFF = 0,
 	DPP_STATE_ON,
+	DPP_STATE_HANDOVER,
 };
 
 struct eotf_debug_override {
@@ -92,6 +93,7 @@ struct dpp_device {
 	unsigned int win_id;	/* connected window id */
 	bool is_win_connected;	/* Is dpp connected to window ? */
 	bool protection;
+	u32 rdma_mst_security;	/* read MST_SECURITY from rdma register */
 
 	/*
 	 * comp_src means compression source of input buffer compressed by
