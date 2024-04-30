@@ -1518,9 +1518,11 @@ static const struct exynos_drm_crtc_ops decon_crtc_ops = {
 	.wait_for_flip_done = decon_wait_for_flip_done,
 };
 
-static int dpu_sysmmu_fault_handler(struct iommu_fault *fault, void *data)
+static int dpu_sysmmu_fault_handler(struct iommu_domain *domain,
+				    struct device *dev, unsigned long iova,
+				    int flags, void *token)
 {
-	struct decon_device *decon = data;
+	struct decon_device *decon = token;
 
 	if (!decon || !decon_is_effectively_active(decon))
 		return 0;
@@ -1571,6 +1573,7 @@ static int decon_bind(struct device *dev, struct device *master, void *data)
 	struct drm_device *drm_dev = data;
 	struct exynos_drm_private *priv = drm_to_exynos_dev(drm_dev);
 	struct drm_plane *default_plane;
+	struct iommu_domain *domain;
 	int i, ret;
 	char symlink_name_buffer[7];
 
@@ -1605,7 +1608,11 @@ static int decon_bind(struct device *dev, struct device *master, void *data)
 
 	priv->iommu_client = dev;
 
-	iommu_register_device_fault_handler(dev, dpu_sysmmu_fault_handler, decon);
+	domain = iommu_get_domain_for_dev(dev);
+	if (domain)
+		/* Used just for logging. */
+		iommu_set_fault_handler(domain, dpu_sysmmu_fault_handler,
+					decon);
 
 #if IS_ENABLED(CONFIG_EXYNOS_ITMON)
 	decon->itmon_nb.notifier_call = dpu_itmon_notifier;
@@ -1653,8 +1660,6 @@ static void decon_unbind(struct device *dev, struct device *master,
 #if IS_ENABLED(CONFIG_EXYNOS_ITMON)
 	itmon_notifier_chain_unregister(&decon->itmon_nb);
 #endif
-	iommu_unregister_device_fault_handler(dev);
-
 	decon_debug(decon, "%s -\n", __func__);
 }
 
