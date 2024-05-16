@@ -96,8 +96,10 @@ void decon_dump(const struct decon_device *decon)
 {
 	int i;
 	struct decon_device *d;
-	struct drm_printer p = console_set_on_cmdline ?
-		drm_debug_printer("[drm]") : drm_info_printer(decon->dev);
+	struct drm_printer p = (console_set_on_cmdline
+				? drm_dbg_printer(decon->drm_dev, DRM_UT_DRIVER,
+						  "[drm]")
+				: drm_info_printer(decon->dev));
 
 	for (i = 0; i < REGS_DECON_ID_MAX; ++i) {
 		d = get_decon_drvdata(i);
