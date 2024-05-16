@@ -440,6 +440,14 @@ struct exynos_panel_funcs {
 	 */
 	unsigned int (*get_te_usec)(struct exynos_panel *exynos_panel,
 				    const struct exynos_panel_mode *pmode);
+
+	/**
+	 * @on_queue_ddic_cmd
+	 *
+	 * This callback is to nofity the panel driver when a ddic command is queued.
+	 */
+	void (*on_queue_ddic_cmd)(struct exynos_panel *exynos_panel,
+			const struct mipi_dsi_msg *msg, const bool is_last);
 };
 
 /**
@@ -529,6 +537,21 @@ enum local_hbm_enable_state {
 	LOCAL_HBM_ENABLING,
 };
 
+/**
+ * enum mode_progress_type - the type while mode switch is in progress
+ * @MODE_DONE: mode switch is done
+ * @MODE_RES_IN_PROGRESS: mode switch is in progress, only resolution is changed
+ * @MODE_RR_IN_PROGRESS: mode switch is in progress, only refresh rate is changed
+ * @MODE_RES_AND_RR_IN_PROGRESS: mode switch is in progress, both resolution and
+ * 				 refresh rate are changed
+ */
+enum mode_progress_type {
+	MODE_DONE = 0,
+	MODE_RES_IN_PROGRESS,
+	MODE_RR_IN_PROGRESS,
+	MODE_RES_AND_RR_IN_PROGRESS,
+};
+
 struct exynos_bl_notifier {
 	u32 ranges[MAX_BL_RANGES];
 	u32 num_ranges;
@@ -577,6 +600,8 @@ struct exynos_panel {
 	bool panel_idle_enabled;
 	/* indicates need to do specific handle when exiting idle on self refresh */
 	bool panel_need_handle_idle_exit;
+	/* indicates need to update idle mode setting when getting a commit */
+	bool panel_update_idle_mode_pending;
 	/* indicates self refresh is active */
 	bool self_refresh_active;
 	/* indicates if panel brightness is set or not after reset */
@@ -671,6 +696,9 @@ struct exynos_panel {
 
 		struct workqueue_struct *wq;
 	} hbm;
+
+	/* current type of mode switch */
+	enum mode_progress_type mode_in_progress;
 };
 
 /**
