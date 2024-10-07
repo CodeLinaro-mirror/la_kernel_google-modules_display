@@ -791,12 +791,6 @@ static struct dsim_pll_params *dsim_of_get_clock_mode(struct dsim_device *dsim)
 	if (!pll_params)
 		goto err_put_mode_np;
 
-	entry = of_get_next_child(mode_np, NULL);
-	if (!entry) {
-		dsim_err(dsim, "could not find child node of dsim-modes");
-		goto err_put_mode_np;
-	}
-
 	pll_params->num_modes = of_get_child_count(mode_np);
 	if (pll_params->num_modes == 0) {
 		dsim_err(dsim, "%pOF: no modes specified\n", np);
