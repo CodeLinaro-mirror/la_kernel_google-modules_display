@@ -1562,20 +1562,22 @@ static int dsim_remap_regs(struct dsim_device *dsim)
 	i = of_property_match_string(np, "reg-names", "sys");
 	if (of_address_to_resource(np, i, &res)) {
 		dsim_err(dsim, "failed to get sys resource\n");
-		goto err_dphy_ext;
+		goto err_node_put;
 	}
 	dsim->res.ss_reg_base = ioremap(res.start, resource_size(&res));
 	if (!dsim->res.ss_reg_base) {
 		dsim_err(dsim, "failed to map sysreg-disp address.");
 		ret = PTR_ERR(dsim->res.ss_reg_base);
-		goto err_dphy_ext;
+		goto err_node_put;
 	}
 	dsim_regs_desc_init(dsim->res.ss_reg_base, res.start, np->name, REGS_DSIM_SYS,
 			dsim->id);
+	of_node_put(np);
 
 	return ret;
 
-err_dphy_ext:
+err_node_put:
+	of_node_put(np);
 	iounmap(dsim->res.phy_regs_ex);
 	iounmap(dsim->res.phy_regs);
 err_dsi:

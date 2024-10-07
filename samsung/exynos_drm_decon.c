@@ -2006,8 +2006,10 @@ static int decon_remap_regs(struct decon_device *decon)
 	i = of_property_match_string(np, "reg-names", "sys");
 	if (of_address_to_resource(np, i, &res)) {
 		decon_err(decon, "failed to get sys resource\n");
-		goto err_main;
+		goto err_node_put;
 	}
+	of_node_put(np);
+
 	decon->regs.ss_regs = ioremap(res.start, resource_size(&res));
 	if (!decon->regs.ss_regs) {
 		decon_err(decon, "failed to map sysreg-disp address.");
@@ -2019,6 +2021,8 @@ static int decon_remap_regs(struct decon_device *decon)
 
 	return ret;
 
+err_node_put:
+	of_node_put(np);
 err_main:
 	iounmap(decon->regs.regs);
 err:
