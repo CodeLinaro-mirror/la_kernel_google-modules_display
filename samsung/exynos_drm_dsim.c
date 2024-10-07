@@ -772,7 +772,7 @@ read_node_fail:
 static struct dsim_pll_params *dsim_of_get_clock_mode(struct dsim_device *dsim)
 {
 	struct device *dev = dsim->dev;
-	struct device_node *np, *mode_np, *entry;
+	struct device_node *np, *mode_np;
 	struct dsim_pll_params *pll_params;
 
 	np = of_parse_phandle(dev->of_node, "dsim_mode", 0);
@@ -804,12 +804,12 @@ static struct dsim_pll_params *dsim_of_get_clock_mode(struct dsim_device *dsim)
 
 	pll_params->num_modes = 0;
 
-	for_each_child_of_node(mode_np, entry) {
+	for_each_child_of_node_scoped(mode_np, entry) {
 		struct dsim_pll_param *pll_param;
 
 		pll_param = devm_kzalloc(dsim->dev, sizeof(*pll_param), GFP_KERNEL);
 		if (!pll_param)
-			goto err_put_entry;
+			goto err_put_mode_np;
 
 		if (dsim_of_parse_modes(entry, pll_param) < 0) {
 			kfree(pll_param);
@@ -824,12 +824,9 @@ static struct dsim_pll_params *dsim_of_get_clock_mode(struct dsim_device *dsim)
 
 	of_node_put(np);
 	of_node_put(mode_np);
-	of_node_put(entry);
 
 	return pll_params;
 
-err_put_entry:
-	of_node_put(entry);
 err_put_mode_np:
 	of_node_put(mode_np);
 err_put_np:
@@ -916,7 +913,6 @@ static int dsim_of_parse_diag(struct device_node *np, struct dsim_dphy_diag *dia
 static void dsim_of_get_pll_diags(struct dsim_device *dsim)
 {
 	struct device_node *np __free(device_node);
-	struct device_node *entry;
 	struct device *dev = dsim->dev;
         uint32_t index = 0;
 
@@ -935,7 +931,7 @@ static void dsim_of_get_pll_diags(struct dsim_device *dsim)
                 goto nochild;
         }
 
-        for_each_child_of_node(np, entry) {
+        for_each_child_of_node_scoped(np, entry) {
                 if (index >= dsim->config.num_dphy_diags) {
                       dsim_warn(dsim, "%s: diag parsing error with unexpected index %u\n",
                                 __func__, index);
