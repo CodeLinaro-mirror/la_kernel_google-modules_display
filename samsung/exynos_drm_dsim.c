@@ -1259,13 +1259,12 @@ static int dsim_add_mipi_dsi_device(struct dsim_device *dsim,
 	struct mipi_dsi_device_info info = {
 		.node = NULL,
 	};
-	struct device_node *node;
 	const char *name;
 	const char *dual_dsi;
 
 	dsim_debug(dsim, "preferred panel is %s\n", pname);
 
-	for_each_available_child_of_node(dsim->dsi_host.dev->of_node, node) {
+	for_each_available_child_of_node_scoped(dsim->dsi_host.dev->of_node, node) {
 		bool found;
 
 		/*
