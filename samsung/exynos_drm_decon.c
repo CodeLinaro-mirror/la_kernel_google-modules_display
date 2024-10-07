@@ -21,6 +21,7 @@
 #include <drm/exynos_drm.h>
 
 #include <linux/atomic.h>
+#include <linux/cleanup.h>
 #include <linux/clk.h>
 #include <linux/component.h>
 #include <linux/console.h>
@@ -1767,7 +1768,7 @@ static irqreturn_t decon_fs_irq_handler(int irq, void *dev_data)
 
 static int decon_parse_dt(struct decon_device *decon, struct device_node *np)
 {
-	struct device_node *dpp_np = NULL;
+	struct device_node *dpp_np __free(device_node) = NULL;
 	u32 val;
 	int ret = 0, i;
 	int dpp_id;
@@ -1952,8 +1953,7 @@ static int decon_parse_dt(struct decon_device *decon, struct device_node *np)
 		dpp_id = decon->dpp[i]->id;
 		decon_info(decon, "found dpp%d\n", dpp_id);
 
-		if (dpp_np)
-			of_node_put(dpp_np);
+		of_node_put(dpp_np);
 	}
 
 	/* RCD Function */
@@ -1966,9 +1966,6 @@ static int decon_parse_dt(struct decon_device *decon, struct device_node *np)
 		decon_debug(decon, "can't find rcd structure\n");
 	else
 		decon_debug(decon, "found rcd: dpp%d\n", decon->rcd->id);
-
-	if (dpp_np)
-		of_node_put(dpp_np);
 
 	of_property_for_each_u32(np, "connector", val)
 		decon->con_type |= val;

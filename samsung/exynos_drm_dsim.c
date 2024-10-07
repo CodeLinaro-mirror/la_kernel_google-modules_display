@@ -21,6 +21,7 @@
 #include <drm/drm_modes.h>
 #include <drm/drm_vblank.h>
 
+#include <linux/cleanup.h>
 #include <linux/clk.h>
 #include <linux/console.h>
 #include <linux/errno.h>
@@ -920,7 +921,8 @@ static int dsim_of_parse_diag(struct device_node *np, struct dsim_dphy_diag *dia
 
 static void dsim_of_get_pll_diags(struct dsim_device *dsim)
 {
-	struct device_node *np, *entry;
+	struct device_node *np __free(device_node);
+	struct device_node *entry;
 	struct device *dev = dsim->dev;
         uint32_t index = 0;
 
