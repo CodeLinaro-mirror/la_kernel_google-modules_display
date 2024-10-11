@@ -24,6 +24,7 @@
 #include <linux/cleanup.h>
 #include <linux/clk.h>
 #include <linux/console.h>
+#include <linux/device.h>
 #include <linux/errno.h>
 #include <linux/gpio/consumer.h>
 #include <linux/irq.h>
@@ -641,16 +642,20 @@ static int dsim_set_clock_mode(struct dsim_device *dsim,
 	return 0;
 }
 
-static int dsim_of_parse_modes(struct device_node *entry,
-		struct dsim_pll_param *pll_param)
+static int dsim_of_parse_modes(struct device *dev, struct device_node *entry,
+			       struct dsim_pll_param *pll_param)
 {
+	const char *name;
 	u32 res[14];
 	int cnt;
 
 	memset(pll_param, 0, sizeof(*pll_param));
 
-	of_property_read_string(entry, "mode-name",
-			(const char **)&pll_param->name);
+	if (!of_property_read_string(entry, "mode-name", &name)) {
+		pll_param->name = devm_kstrdup(dev, name, GFP_KERNEL);
+		if (name && !pll_param->name)
+			return -ENOMEM;
+	}
 
 	cnt = of_property_count_u32_elems(entry, "pmsk");
 	if (cnt != 4 && cnt != 14) {
@@ -811,7 +816,7 @@ static struct dsim_pll_params *dsim_of_get_clock_mode(struct dsim_device *dsim)
 		if (!pll_param)
 			goto err_put_mode_np;
 
-		if (dsim_of_parse_modes(entry, pll_param) < 0) {
+		if (dsim_of_parse_modes(dev, entry, pll_param) < 0) {
 			kfree(pll_param);
 			continue;
 		}
@@ -852,11 +857,13 @@ static void dsim_restart(struct dsim_device *dsim)
 
 #ifdef CONFIG_DEBUG_FS
 
-static int dsim_of_parse_diag(struct device_node *np, struct dsim_dphy_diag *diag)
+static int dsim_of_parse_diag(struct device *dev, struct device_node *np,
+			      struct dsim_dphy_diag *diag)
 {
         int count;
         u8 bit_range[2];
         const char *reg_base = NULL;
+	const char *name;
 
         of_property_read_string(np, "reg-base", &reg_base);
         if (!strcmp(reg_base, "dphy")) {
@@ -873,9 +880,21 @@ static int dsim_of_parse_diag(struct device_node *np, struct dsim_dphy_diag *dia
                 pr_err("%s: empty diag-name\n", __func__);
                 return -EINVAL;
         }
+	diag->name = devm_kstrdup(dev, diag->name, GFP_KERNEL);
+	if (!diag->name)
+		return -ENOMEM;
 
-        of_property_read_string(np, "desc", &diag->desc);
-        of_property_read_string(np, "help", &diag->help);
+	name = NULL;
+	of_property_read_string(np, "desc", &name);
+	diag->desc = devm_kstrdup(dev, name, GFP_KERNEL);
+	if (name && !diag->desc)
+		return -ENOMEM;
+
+	name = NULL;
+	of_property_read_string(np, "help", &name);
+	diag->help = devm_kstrdup(dev, name, GFP_KERNEL);
+	if (name && !diag->help)
+		return -ENOMEM;
 
         count = of_property_count_u16_elems(np, "reg-offset");
         if (count <= 0 || count > MAX_DIAG_REG_NUM) {
@@ -938,7 +957,7 @@ static void dsim_of_get_pll_diags(struct dsim_device *dsim)
                       goto get_diag_fail;
                 }
 
-                if (dsim_of_parse_diag(entry, &dsim->config.dphy_diags[index]) < 0) {
+		if (dsim_of_parse_diag(dev, entry, &dsim->config.dphy_diags[index]) < 0) {
                       dsim_warn(dsim, "%s: diag parsing error for item %u\n",
                                 __func__, index);
                       goto get_diag_fail;
