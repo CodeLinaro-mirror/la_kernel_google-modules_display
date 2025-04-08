@@ -538,9 +538,11 @@ void decon_mode_bts_pre_update(struct decon_device *decon,
 				const struct drm_crtc_state *crtc_state,
 				const struct drm_atomic_state *state);
 #else
-void decon_mode_bts_pre_update(struct decon_device *decon,
-				const struct drm_crtc_state *crtc_state,
-				const struct drm_atomic_state *state) { }
+static inline void decon_mode_bts_pre_update(struct decon_device *decon,
+					     const struct drm_crtc_state *crtc_state,
+					     const struct drm_atomic_state *state)
+{
+}
 #endif
 
 #if IS_ENABLED(CONFIG_EXYNOS_ITMON)
