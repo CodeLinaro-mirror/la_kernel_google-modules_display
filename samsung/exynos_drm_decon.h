@@ -27,7 +27,6 @@
 #if IS_ENABLED(CONFIG_EXYNOS_ITMON)
 #include <soc/google/exynos-itmon.h>
 #endif
-#include <soc/google/bts.h>
 #include <drm/drm_device.h>
 #include <video/videomode.h>
 
