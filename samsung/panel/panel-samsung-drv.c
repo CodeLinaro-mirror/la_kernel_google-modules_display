@@ -3618,7 +3618,7 @@ static int exynos_panel_bridge_atomic_check(struct drm_bridge *bridge,
 }
 
 static void exynos_panel_bridge_pre_enable(struct drm_bridge *bridge,
-					   struct drm_bridge_state *old_bridge_state)
+					   struct drm_atomic_state *old_state)
 {
 	struct exynos_panel *ctx = bridge_to_exynos_panel(bridge);
 
