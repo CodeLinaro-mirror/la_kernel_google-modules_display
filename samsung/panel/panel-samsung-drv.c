@@ -3463,7 +3463,7 @@ static void exynos_panel_bridge_detach(struct drm_bridge *bridge)
 }
 
 static void exynos_panel_bridge_enable(struct drm_bridge *bridge,
-				       struct drm_bridge_state *old_bridge_state)
+				       struct drm_atomic_state *old_state)
 {
 	struct exynos_panel *ctx = bridge_to_exynos_panel(bridge);
 	bool need_update_backlight = false;
