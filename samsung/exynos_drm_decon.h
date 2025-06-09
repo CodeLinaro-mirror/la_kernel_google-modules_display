@@ -20,7 +20,7 @@
 #include <linux/device.h>
 #include <linux/pm_runtime.h>
 #include <linux/spinlock.h>
-#if IS_ENABLED(CONFIG_EXYNOS_PM_QOS) || IS_ENABLED(CONFIG_EXYNOS_PM_QOS_MODULE)
+#if IS_ENABLED(CONFIG_EXYNOS_PM_QOS)
 #include <soc/google/exynos_pm_qos.h>
 #endif
 #include <linux/notifier.h>
@@ -168,7 +168,7 @@ struct dpu_bts {
 	u32 ch_bw[MAX_AXI_PORT];
 	int bw_idx;
 	struct dpu_bts_ops *ops;
-#if IS_ENABLED(CONFIG_EXYNOS_PM_QOS) || IS_ENABLED(CONFIG_EXYNOS_PM_QOS_MODULE)
+#if IS_ENABLED(CONFIG_EXYNOS_PM_QOS)
 	struct exynos_pm_qos_request mif_qos;
 	struct exynos_pm_qos_request int_qos;
 	struct exynos_pm_qos_request disp_qos;
