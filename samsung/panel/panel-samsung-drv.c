@@ -3418,7 +3418,7 @@ static void exynos_panel_node_attach(struct exynos_drm_connector *exynos_connect
 		dev_dbg(ctx->dev, "succeed to link %s sysfs\n", sysfs_name);
 }
 
-static int exynos_panel_bridge_attach(struct drm_bridge *bridge,
+static int exynos_panel_bridge_attach(struct drm_bridge *bridge, struct drm_encoder *encoder,
 				      enum drm_bridge_attach_flags flags)
 {
 	struct drm_device *dev = bridge->dev;
@@ -3443,7 +3443,7 @@ static int exynos_panel_bridge_attach(struct drm_bridge *bridge,
 
 	drm_connector_helper_add(connector, &exynos_connector_helper_funcs);
 
-	drm_connector_attach_encoder(connector, bridge->encoder);
+	drm_connector_attach_encoder(connector, encoder);
 	connector->funcs->reset(connector);
 	connector->status = connector_status_connected;
 	if (ctx->desc->exynos_panel_func && ctx->desc->exynos_panel_func->commit_done)
