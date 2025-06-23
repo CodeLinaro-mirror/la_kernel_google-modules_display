@@ -2248,6 +2248,11 @@ static int decon_probe(struct platform_device *pdev)
 	exynos_recovery_register(decon);
 
 	decon->dqe = exynos_dqe_register(decon);
+	if (IS_ERR(decon->dqe)) {
+		if (PTR_ERR(decon->dqe) == -EPROBE_DEFER)
+			return PTR_ERR(decon->dqe);
+		decon->dqe = NULL;
+	}
 
 	decon->cgc_dma = exynos_cgc_dma_register(decon);
 	exynos_rmem_register(decon);
