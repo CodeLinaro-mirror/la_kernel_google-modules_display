@@ -16,7 +16,6 @@
 #include <drm/drm_drv.h>
 #include <drm/drm_modeset_lock.h>
 #include <drm/drm_atomic_helper.h>
-#include <soc/google/gs-chipid.h>
 
 #include <dqe_cal.h>
 #include <decon_cal.h>
@@ -873,29 +872,21 @@ static struct attribute *atc_attrs[] = {
 };
 ATTRIBUTE_GROUPS(atc);
 
-static int exynos_get_dqe_version(enum dqe_version *dqe_ver)
+extern u32 gs_chipid_get_type(void);
+static enum dqe_version exynos_get_dqe_version(void)
 {
-	int ret = gs_chipid_get_product_id();
+	enum dqe_version dqe_ver = DQE_V1;
 
-	if (ret < 0)
-		return ret;
+	/* TODO : when gs_chipid_get_product_id function is created, it will be changed. */
+#if defined(CONFIG_SOC_GS101)
+	dqe_ver = gs_chipid_get_type() ? DQE_V2 : DQE_V1;
+#elif defined(CONFIG_SOC_GS201)
+	dqe_ver = DQE_V3;
+#else
+	#error "Unknown DQE version."
+#endif
 
-	switch (ret) {
-	case GS101_SOC_ID:
-		ret = gs_chipid_get_type();
-		if (ret < 0)
-			return ret;
-		*dqe_ver = ret ? DQE_V2 : DQE_V1;
-		break;
-	case GS201_SOC_ID:
-		*dqe_ver = DQE_V3;
-		break;
-	default:
-		WARN(1==2, "Unknown product ID %#.8x", ret);
-		*dqe_ver = DQE_VERSION_MAX;
-	}
-
-	return 0;
+	return dqe_ver;
 }
 
 #define MAX_DQE_NAME_SIZE 10
@@ -906,14 +897,9 @@ struct exynos_dqe *exynos_dqe_register(struct decon_device *decon)
 	struct device_node *np = dev->of_node;
 	struct exynos_dqe *dqe;
 	enum dqe_version dqe_version;
-	int i, ret;
+	int i;
 	char dqe_name[MAX_DQE_NAME_SIZE] = "dqe";
-
-	ret = exynos_get_dqe_version(&dqe_version);
-	if (ret < 0)
-		return ERR_PTR(ret);
-	if (dqe_version == DQE_VERSION_MAX)
-		return NULL;
+	const char *dqe_name_heap;
 
 	i = of_property_match_string(np, "reg-names", "dqe");
 	if (i < 0) {
@@ -936,6 +922,7 @@ struct exynos_dqe *exynos_dqe_register(struct decon_device *decon)
 		return NULL;
 	}
 
+	dqe_version = exynos_get_dqe_version();
 	dqe_regs_desc_init(dqe->regs, res.start, "dqe", dqe_version, decon->id);
 	dqe->funcs = &dqe_funcs;
 	dqe->initialized = false;
@@ -943,7 +930,10 @@ struct exynos_dqe *exynos_dqe_register(struct decon_device *decon)
 	spin_lock_init(&dqe->state.histogram_slock);
 
 	scnprintf(dqe_name, MAX_DQE_NAME_SIZE, "dqe%u", decon->id);
-	dqe->dqe_class = class_create(dqe_name);
+	dqe_name_heap = kstrdup(dqe_name, GFP_KERNEL);
+	if (!dqe_name_heap)
+		return NULL;
+	dqe->dqe_class = class_create(dqe_name_heap);
 	if (IS_ERR(dqe->dqe_class)) {
 		pr_err("failed to create dqe class\n");
 		return NULL;

@@ -77,7 +77,6 @@ struct exynos_display_dsc {
 
 	const struct drm_dsc_config *cfg;
 
-	unsigned int delay_reg_init_us;
 	bool is_scrv4;
 };
 

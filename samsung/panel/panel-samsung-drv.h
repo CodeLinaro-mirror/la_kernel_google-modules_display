@@ -511,7 +511,6 @@ struct exynos_panel_desc {
 	bool is_panel_idle_supported;
 	bool no_lhbm_rr_constraints;
 	const u32 lhbm_effective_delay_frames;
-	const unsigned int delay_dsc_reg_init_us;
 	const struct brightness_capability *brt_capability;
 	const u32 *bl_range;
 	u32 bl_num_ranges;

@@ -8,6 +8,7 @@ filegroup(
         "samsung/**/*.h",
     ]),
     visibility = [
+        "//private/devices/google:__subpackages__",
         "//private/google-modules/touch:__subpackages__",
     ],
 )
@@ -30,7 +31,10 @@ kernel_module(
         "samsung/panel/panel-samsung-drv.ko",
         "samsung/panel/panel-samsung-emul.ko",
         "samsung/panel/panel-samsung-s6e3fc3.ko",
+        "samsung/panel/panel-samsung-s6e3fc3-l10.ko",
         "samsung/panel/panel-samsung-s6e3fc3-p10.ko",
+        "samsung/panel/panel-samsung-s6e3fc3_6a.ko",
+        "samsung/panel/panel-samsung-s6e3fc5.ko",
         "samsung/panel/panel-samsung-s6e3hc2.ko",
         "samsung/panel/panel-samsung-s6e3hc3.ko",
         "samsung/panel/panel-samsung-s6e3hc3-c10.ko",
@@ -39,6 +43,7 @@ kernel_module(
     ],
     kernel_build = "//private/google-modules/soc/gs:gs_kernel_build",
     visibility = [
+        "//private/devices/google:__subpackages__",
         "//private/google-modules/soc/gs:__pkg__",
     ],
     deps = [
