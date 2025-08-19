@@ -186,12 +186,12 @@ err:
 }
 
 static const struct drm_format_info *
-exynos_get_format_info(const struct drm_mode_fb_cmd2 *cmd)
+exynos_get_format_info(u32 pixel_format, u64 modifier)
 {
 	const struct drm_format_info *info = NULL;
 
-	if (cmd->modifier[0] == DRM_FORMAT_MOD_SAMSUNG_COLORMAP) {
-		info = drm_format_info(cmd->pixel_format);
+	if (modifier == DRM_FORMAT_MOD_SAMSUNG_COLORMAP) {
+		info = drm_format_info(pixel_format);
 		if (info->format == DRM_FORMAT_BGRA8888)
 			return info;
 
