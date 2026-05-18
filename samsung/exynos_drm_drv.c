@@ -357,6 +357,21 @@ int exynos_atomic_check(struct drm_device *dev,
 	return 0;
 }
 
+static struct drm_private_state *exynos_atomic_create_priv_state(struct drm_private_obj *obj)
+{
+	struct exynos_drm_priv_state *priv_state;
+
+	priv_state = kzalloc(sizeof(*priv_state), GFP_KERNEL);
+	if (!priv_state)
+		return ERR_PTR(-ENOMEM);
+
+	priv_state->available_win_mask = BIT(MAX_WIN_PER_DECON) - 1;
+
+	__drm_atomic_helper_private_obj_create_state(obj, &priv_state->base);
+
+	return &priv_state->base;
+}
+
 static struct drm_private_state *exynos_atomic_duplicate_priv_state(struct drm_private_obj *obj)
 {
 	const struct exynos_drm_priv_state *old_state = to_exynos_priv_state(obj->state);
@@ -380,6 +395,7 @@ static void exynos_atomic_destroy_priv_state(struct drm_private_obj *obj,
 }
 
 static const struct drm_private_state_funcs exynos_priv_state_funcs = {
+	.atomic_create_state = exynos_atomic_create_priv_state,
 	.atomic_duplicate_state = exynos_atomic_duplicate_priv_state,
 	.atomic_destroy_state = exynos_atomic_destroy_priv_state,
 };
@@ -955,7 +971,6 @@ static int exynos_drm_bind(struct device *dev)
 	struct exynos_drm_private *private;
 	struct drm_encoder *encoder;
 	struct drm_device *drm;
-	struct exynos_drm_priv_state *priv_state;
 	u32 wb_mask = 0;
 	u32 encoder_mask = 0;
 	int ret;
@@ -983,13 +998,7 @@ static int exynos_drm_bind(struct device *dev)
 	/* create properties ahead of binding to make them available to all drivers */
 	exynos_drm_connector_create_properties(drm);
 
-	priv_state = kzalloc(sizeof(*priv_state), GFP_KERNEL);
-	if (!priv_state)
-		return -ENOMEM;
-
-	priv_state->available_win_mask = BIT(MAX_WIN_PER_DECON) - 1;
-
-	drm_atomic_private_obj_init(drm, &private->obj, &priv_state->base,
+	drm_atomic_private_obj_init(drm, &private->obj,
 				    &exynos_priv_state_funcs);
 
 	/* Try to bind all sub drivers. */
