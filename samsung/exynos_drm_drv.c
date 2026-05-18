@@ -438,7 +438,7 @@ static int exynos_atomic_helper_wait_for_fences(struct drm_device *dev,
 			}
 			print_drm_plane_state_info(&p, new_plane_state);
 
-			spin_lock_irq(fence->lock);
+			spin_lock_irq(dma_fence_spinlock(fence));
 			drm_printf(&p, "fence: %s-%s %llu-%llu status:%s\n",
 				fence->ops ? fence->ops->get_driver_name(fence) : "none",
 				fence->ops ? fence->ops->get_timeline_name(fence) : "none",
@@ -451,7 +451,7 @@ static int exynos_atomic_helper_wait_for_fences(struct drm_device *dev,
 			}
 			if (fence->error)
 				drm_printf(&p, "fence: err=%d\n", fence->error);
-			spin_unlock_irq(fence->lock);
+			spin_unlock_irq(dma_fence_spinlock(fence));
 
 			tmo = 0;
 			err = -ETIMEDOUT;
