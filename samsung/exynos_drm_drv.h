@@ -364,7 +364,7 @@ to_exynos_priv_state(const struct drm_private_state *state)
  */
 struct exynos_drm_private {
 	struct drm_device drm;
-	struct drm_atomic_state *suspend_state;
+	struct drm_atomic_commit *suspend_state;
 	struct device *iommu_client;
 	void *mapping;
 	bool tui_enabled;
@@ -399,9 +399,9 @@ static inline int exynos_dpi_bind(struct drm_device *dev,
 }
 #endif
 
-int exynos_atomic_commit(struct drm_device *dev, struct drm_atomic_state *state,
+int exynos_atomic_commit(struct drm_device *dev, struct drm_atomic_commit *state,
 			 bool nonblock);
-int exynos_atomic_check(struct drm_device *dev, struct drm_atomic_state *state);
+int exynos_atomic_check(struct drm_device *dev, struct drm_atomic_commit *state);
 int exynos_atomic_enter_tui(void);
 int exynos_atomic_exit_tui(void);
 

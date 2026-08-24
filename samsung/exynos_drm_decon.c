@@ -286,7 +286,7 @@ static int decon_get_crtc_out_type(const struct drm_crtc_state *crtc_state)
 static bool has_writeback_job(struct drm_crtc_state *new_crtc_state)
 {
 	int i;
-	struct drm_atomic_state *state = new_crtc_state->state;
+	struct drm_atomic_commit *state = new_crtc_state->state;
 	struct drm_connector_state *conn_state;
 	struct drm_connector *conn;
 
@@ -400,7 +400,7 @@ static bool decon_is_seamless_possible(const struct decon_device *decon,
 static int decon_check_modeset(struct exynos_drm_crtc *exynos_crtc,
 			       struct drm_crtc_state *crtc_state)
 {
-	struct drm_atomic_state *state = crtc_state->state;
+	struct drm_atomic_commit *state = crtc_state->state;
 	const struct decon_device *decon = exynos_crtc->ctx;
 	struct exynos_drm_crtc_state *exynos_crtc_state;
 	const struct exynos_drm_connector_state *exynos_conn_state;
@@ -1062,7 +1062,7 @@ static void decon_seamless_mode_bts_update(struct decon_device *decon,
 #define DEFAULT_VBLANK_USEC	100
 
 static unsigned int decon_get_vblank_usec(const struct drm_crtc_state *crtc_state,
-					const struct drm_atomic_state *old_state)
+					const struct drm_atomic_commit *old_state)
 {
 	const struct exynos_drm_connector_state *exynos_conn_state =
 			crtc_get_exynos_connector_state(old_state, crtc_state);
@@ -1075,7 +1075,7 @@ static unsigned int decon_get_vblank_usec(const struct drm_crtc_state *crtc_stat
 
 void decon_mode_bts_pre_update(struct decon_device *decon,
 				const struct drm_crtc_state *crtc_state,
-				const struct drm_atomic_state *old_state)
+				const struct drm_atomic_commit *old_state)
 {
 	const struct exynos_drm_crtc_state *exynos_crtc_state = to_exynos_crtc_state(crtc_state);
 
@@ -1102,7 +1102,7 @@ static void decon_seamless_mode_set(struct exynos_drm_crtc *exynos_crtc,
 	struct drm_crtc *crtc = &exynos_crtc->base;
 	struct decon_device *decon = exynos_crtc->ctx;
 	struct drm_crtc_state *crtc_state = crtc->state;
-	struct drm_atomic_state *old_state = old_crtc_state->state;
+	struct drm_atomic_commit *old_state = old_crtc_state->state;
 	struct drm_connector *conn;
 	struct drm_connector_state *conn_state;
 	struct drm_display_mode *mode, *adjusted_mode;
@@ -1251,7 +1251,7 @@ static void decon_enable(struct exynos_drm_crtc *exynos_crtc, struct drm_crtc_st
 	decon_info(decon, "%s +\n", __func__);
 
 	if (crtc_state->mode_changed || crtc_state->connectors_changed) {
-		const struct drm_atomic_state *state = old_crtc_state->state;
+		const struct drm_atomic_commit *state = old_crtc_state->state;
 		const struct exynos_drm_connector_state *exynos_conn_state =
 			crtc_get_exynos_connector_state(state, crtc_state);
 
@@ -2301,7 +2301,7 @@ static int decon_runtime_resume(struct device *dev)
 static int decon_atomic_suspend(struct decon_device *decon)
 {
 	struct drm_modeset_acquire_ctx ctx;
-	struct drm_atomic_state *suspend_state;
+	struct drm_atomic_commit *suspend_state;
 	int ret = 0;
 
 	if (!decon) {
@@ -2332,7 +2332,7 @@ static int decon_atomic_resume(struct decon_device *decon)
 	drm_modeset_acquire_init(&ctx, 0);
 	if (!IS_ERR_OR_NULL(decon->suspend_state)) {
 		ret = exynos_crtc_resume(decon->suspend_state, &ctx);
-		drm_atomic_state_put(decon->suspend_state);
+		drm_atomic_commit_put(decon->suspend_state);
 	}
 	decon->suspend_state = NULL;
 	drm_modeset_drop_locks(&ctx);

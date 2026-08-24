@@ -247,7 +247,7 @@ struct exynos_drm_connector_properties *
 exynos_drm_connector_get_properties(struct exynos_drm_connector *exynos_conector);
 
 static inline struct exynos_drm_connector_state *
-crtc_get_exynos_connector_state(const struct drm_atomic_state *state,
+crtc_get_exynos_connector_state(const struct drm_atomic_commit *state,
 				const struct drm_crtc_state *crtc_state)
 {
 	const struct drm_connector *conn;

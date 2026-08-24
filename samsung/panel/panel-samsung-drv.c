@@ -2258,7 +2258,7 @@ static int exynos_drm_connector_check_mode(struct exynos_panel *ctx,
  * connector state (without adjusted mode), or to decide if modeset may be required
  */
 static int exynos_drm_connector_atomic_check(struct drm_connector *connector,
-					     struct drm_atomic_state *state)
+					     struct drm_atomic_commit *state)
 {
 	struct exynos_drm_connector *exynos_connector = to_exynos_connector(connector);
 	struct exynos_panel *ctx = exynos_connector_to_panel(exynos_connector);
@@ -3466,7 +3466,7 @@ static void exynos_panel_bridge_detach(struct drm_bridge *bridge)
 }
 
 static void exynos_panel_bridge_enable(struct drm_bridge *bridge,
-				       struct drm_atomic_state *old_state)
+				       struct drm_atomic_commit *old_state)
 {
 	struct exynos_panel *ctx = bridge_to_exynos_panel(bridge);
 	bool need_update_backlight = false;
@@ -3532,7 +3532,7 @@ static int exynos_panel_bridge_atomic_check(struct drm_bridge *bridge,
 					    struct drm_connector_state *conn_state)
 {
 	struct exynos_panel *ctx = bridge_to_exynos_panel(bridge);
-	struct drm_atomic_state *state = new_crtc_state->state;
+	struct drm_atomic_commit *state = new_crtc_state->state;
 	const struct drm_display_mode *current_mode = &ctx->current_mode->mode;
 	const struct exynos_panel_funcs *funcs = ctx->desc->exynos_panel_func;
 	int ret;
@@ -3621,7 +3621,7 @@ static int exynos_panel_bridge_atomic_check(struct drm_bridge *bridge,
 }
 
 static void exynos_panel_bridge_pre_enable(struct drm_bridge *bridge,
-					   struct drm_atomic_state *old_state)
+					   struct drm_atomic_commit *old_state)
 {
 	struct exynos_panel *ctx = bridge_to_exynos_panel(bridge);
 
@@ -3636,7 +3636,7 @@ static void exynos_panel_bridge_pre_enable(struct drm_bridge *bridge,
 }
 
 static void exynos_panel_bridge_disable(struct drm_bridge *bridge,
-					struct drm_atomic_state *old_state)
+					struct drm_atomic_commit *old_state)
 {
 	struct exynos_panel *ctx = bridge_to_exynos_panel(bridge);
 	const struct drm_connector_state *conn_state = ctx->exynos_connector.base.state;
@@ -3678,7 +3678,7 @@ static void exynos_panel_bridge_disable(struct drm_bridge *bridge,
 }
 
 static void exynos_panel_bridge_post_disable(struct drm_bridge *bridge,
-					     struct drm_atomic_state *old_state)
+					     struct drm_atomic_commit *old_state)
 {
 	struct exynos_panel *ctx = bridge_to_exynos_panel(bridge);
 

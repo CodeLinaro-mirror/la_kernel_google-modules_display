@@ -50,7 +50,7 @@
 
 EXPORT_TRACEPOINT_SYMBOL(tracing_mark_write);
 
-static struct exynos_drm_priv_state *exynos_drm_get_priv_state(struct drm_atomic_state *state)
+static struct exynos_drm_priv_state *exynos_drm_get_priv_state(struct drm_atomic_commit *state)
 {
 	struct exynos_drm_private *priv = drm_to_exynos_dev(state->dev);
 
@@ -95,7 +95,7 @@ static unsigned int exynos_drm_crtc_get_win_cnt(struct drm_crtc_state *crtc_stat
 	return num_planes ? : 1;
 }
 
-static int exynos_atomic_check_windows(struct drm_device *dev, struct drm_atomic_state *state)
+static int exynos_atomic_check_windows(struct drm_device *dev, struct drm_atomic_commit *state)
 {
 	struct drm_crtc *crtc;
 	struct drm_crtc_state *old_crtc_state, *new_crtc_state;
@@ -213,7 +213,7 @@ static int exynos_atomic_check_windows(struct drm_device *dev, struct drm_atomic
 	return 0;
 }
 
-static void exynos_atomic_prepare_partial_update(struct drm_atomic_state *state)
+static void exynos_atomic_prepare_partial_update(struct drm_atomic_commit *state)
 {
 	struct drm_crtc *crtc;
 	struct drm_crtc_state *old_crtc_state, *new_crtc_state;
@@ -253,7 +253,7 @@ static void exynos_atomic_prepare_partial_update(struct drm_atomic_state *state)
 	}
 }
 
-static void exynos_check_updated_planes(struct drm_device *dev, struct drm_atomic_state *state)
+static void exynos_check_updated_planes(struct drm_device *dev, struct drm_atomic_commit *state)
 {
 	struct drm_plane *plane;
 	struct drm_plane_state *plane_state;
@@ -275,7 +275,7 @@ static void exynos_check_updated_planes(struct drm_device *dev, struct drm_atomi
 	}
 }
 
-static int exynos_add_relevant_connectors(struct drm_atomic_state *state)
+static int exynos_add_relevant_connectors(struct drm_atomic_commit *state)
 {
 	struct drm_crtc *crtc;
 	struct drm_crtc_state *crtc_state;
@@ -318,7 +318,7 @@ static int exynos_add_relevant_connectors(struct drm_atomic_state *state)
 }
 
 int exynos_atomic_check(struct drm_device *dev,
-			struct drm_atomic_state *state)
+			struct drm_atomic_commit *state)
 {
 	const struct exynos_drm_private *private = drm_to_exynos_dev(dev);
 	int ret;
@@ -412,7 +412,7 @@ static void print_drm_plane_state_info(struct drm_printer *p,
 }
 
 static int exynos_atomic_helper_wait_for_fences(struct drm_device *dev,
-				      struct drm_atomic_state *state,
+				      struct drm_atomic_commit *state,
 				      bool pre_swap)
 {
 	struct drm_plane *plane;
@@ -483,7 +483,7 @@ static int exynos_atomic_helper_wait_for_fences(struct drm_device *dev,
 	return err;
 }
 
-static void commit_tail(struct drm_atomic_state *old_state)
+static void commit_tail(struct drm_atomic_commit *old_state)
 {
 	int i;
 	const struct drm_mode_config_helper_funcs *funcs;
@@ -524,14 +524,14 @@ static void commit_tail(struct drm_atomic_state *old_state)
 
 	drm_atomic_helper_commit_cleanup_done(old_state);
 
-	drm_atomic_state_put(old_state);
+	drm_atomic_commit_put(old_state);
 }
 
 static void commit_kthread_work(struct kthread_work *work)
 {
 	struct exynos_drm_crtc_state *old_exynos_crtc_state =
 		container_of(work, struct exynos_drm_crtc_state, commit_work);
-	struct drm_atomic_state *old_state = old_exynos_crtc_state->base.state;
+	struct drm_atomic_commit *old_state = old_exynos_crtc_state->base.state;
 
 	BUG_ON(!old_state);
 	commit_tail(old_state);
@@ -539,13 +539,13 @@ static void commit_kthread_work(struct kthread_work *work)
 
 static void commit_work(struct work_struct *work)
 {
-	struct drm_atomic_state *old_state =
-		container_of(work, struct drm_atomic_state, commit_work);
+	struct drm_atomic_commit *old_state =
+		container_of(work, struct drm_atomic_commit, commit_work);
 
 	commit_tail(old_state);
 }
 
-static void exynos_atomic_queue_work(struct drm_atomic_state *old_state)
+static void exynos_atomic_queue_work(struct drm_atomic_commit *old_state)
 {
 	struct drm_crtc *crtc;
 	struct drm_crtc_state *old_crtc_state;
@@ -572,7 +572,7 @@ static void exynos_atomic_queue_work(struct drm_atomic_state *old_state)
 	queue_work(system_highpri_wq, &old_state->commit_work);
 }
 
-int exynos_atomic_commit(struct drm_device *dev, struct drm_atomic_state *state, bool nonblock)
+int exynos_atomic_commit(struct drm_device *dev, struct drm_atomic_commit *state, bool nonblock)
 {
 	struct drm_crtc *crtc;
 	struct drm_crtc_state *old_crtc_state;
@@ -639,7 +639,7 @@ int exynos_atomic_commit(struct drm_device *dev, struct drm_atomic_state *state,
 	 * make sure work items don't artificially stall on each another.
 	 */
 
-	drm_atomic_state_get(state);
+	drm_atomic_commit_get(state);
 	if (!nonblock)
 		commit_tail(state);
 	else
@@ -666,7 +666,7 @@ int exynos_atomic_enter_tui(void)
 	int i, ret = 0;
 	struct decon_device *decon = get_decon_drvdata(0);
 	struct drm_device *dev = decon->drm_dev;
-	struct drm_atomic_state *state;
+	struct drm_atomic_commit *state;
 	struct drm_mode_config *mode_config = &dev->mode_config;
 	struct drm_modeset_acquire_ctx ctx;
 	struct drm_plane_state *plane_state;
@@ -695,7 +695,7 @@ int exynos_atomic_enter_tui(void)
 
 	mode_config->suspend_state = state;
 
-	state = drm_atomic_state_alloc(dev);
+	state = drm_atomic_commit_alloc(dev);
 	if (!state) {
 		ret = -ENOMEM;
 		goto err_state_alloc;
@@ -764,11 +764,11 @@ int exynos_atomic_enter_tui(void)
 	}
 
 err:
-	drm_atomic_state_put(state);
+	drm_atomic_commit_put(state);
 
 err_state_alloc:
 	if (ret) {
-		drm_atomic_state_put(mode_config->suspend_state);
+		drm_atomic_commit_put(mode_config->suspend_state);
 		mode_config->suspend_state = NULL;
 	}
 err_dup:
@@ -792,7 +792,7 @@ int exynos_atomic_exit_tui(void)
 	int ret;
 	struct decon_device *decon = get_decon_drvdata(0);
 	struct drm_device *dev = decon->drm_dev;
-	struct drm_atomic_state *state;
+	struct drm_atomic_commit *state;
 	struct drm_mode_config *mode_config = &dev->mode_config;
 	struct drm_modeset_acquire_ctx ctx;
 	struct exynos_drm_private *private = drm_to_exynos_dev(dev);
@@ -835,7 +835,7 @@ int exynos_atomic_exit_tui(void)
 
 	DRM_MODESET_LOCK_ALL_END(dev, ctx, ret);
 	if (!ret)
-		drm_atomic_state_put(state);
+		drm_atomic_commit_put(state);
 
 	pr_debug("%s -\n", __func__);
 	return ret;
