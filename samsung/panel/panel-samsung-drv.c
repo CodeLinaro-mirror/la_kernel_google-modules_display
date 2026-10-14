@@ -4333,7 +4333,7 @@ static const struct drm_bridge_funcs exynos_panel_bridge_funcs = {
 	.atomic_post_disable = exynos_panel_bridge_post_disable,
 	.atomic_duplicate_state = drm_atomic_helper_bridge_duplicate_state,
 	.atomic_destroy_state = drm_atomic_helper_bridge_destroy_state,
-	.atomic_reset = drm_atomic_helper_bridge_reset,
+	.atomic_create_state = drm_atomic_helper_bridge_create_state,
 	.mode_set = exynos_panel_bridge_mode_set,
 };
 
